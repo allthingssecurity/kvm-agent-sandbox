@@ -1,0 +1,8 @@
+# A normal static Linux arm64 binary, linked at a fixed address inside guest RAM (0x81000000)
+# so the supervisor can keep simple identity-mapped page tables.
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=--image-base=0x81000000"]

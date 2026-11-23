@@ -1,0 +1,2 @@
+Q3 numbers: revenue 1.2M, costs 0.9M.
+This file lives on the host; the agent read it through the supervisor and the VMM.

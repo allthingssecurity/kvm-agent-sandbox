@@ -1,0 +1,8 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2024"
+description = "An ordinary Rust program (std, heap, files, hash maps). It doesn't know it runs under a supervisor."
+
+[profile.release]
+opt-level = "s"

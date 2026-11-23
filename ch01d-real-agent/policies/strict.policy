@@ -1,0 +1,18 @@
+# A stricter policy for the same agent: less time, less memory, no file access at all.
+
+time_limit_ms   = 1000
+memory_mb       = 8
+max_output_kb   = 8
+max_open_files  = 0
+
+workspace       = ./workspace
+# (no "read" lines: no path may be opened)
+
+allow = brk mmap munmap mprotect madvise set_tid_address
+allow = rt_sigaction rt_sigprocmask sigaltstack ppoll ioctl
+allow = clock_gettime getpid gettid getuid geteuid getgid getegid
+allow = write writev getrandom
+
+deny openat                         = EACCES    # no files
+deny socket socketpair bind connect = EACCES
+deny clone clone3 execve            = EPERM

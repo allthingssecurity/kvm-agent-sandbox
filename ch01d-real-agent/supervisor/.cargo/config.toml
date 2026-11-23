@@ -1,0 +1,6 @@
+# Bare metal, no floating point: the supervisor must never touch the agent's FP/SIMD registers.
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+rustflags = ["-C", "link-arg=-Tlink.ld", "-C", "relocation-model=static", "-C", "target-feature=+strict-align"]

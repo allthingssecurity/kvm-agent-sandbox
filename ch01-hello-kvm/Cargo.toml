@@ -1,0 +1,12 @@
+[package]
+name = "hello-kvm"
+version = "0.1.0"
+edition = "2024"
+description = "Chapter 1: the smallest complete KVM virtual machine, using raw ioctls"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+strip = true

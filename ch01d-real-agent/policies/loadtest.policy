@@ -1,0 +1,24 @@
+# Load-test policy: the default policy with a long time limit, so idle sandboxes can sit for minutes.
+# Anything not mentioned is refused (fail closed).
+
+# ---- limits ----
+time_limit_ms   = 180000  # long enough for the density test (idle sandboxes)
+memory_mb       = 32      # memory the supervisor will hand out (mmap)
+max_output_kb   = 64      # bytes the agent may print
+max_open_files  = 8
+
+# ---- files: the guest's /workspace is this host folder, read-only ----
+workspace       = ./workspace
+read            = /workspace/          # path prefixes the agent may open
+
+# ---- system calls the agent may make ----
+# memory and start-up (answered inside the VM)
+allow = brk mmap munmap mprotect madvise set_tid_address
+allow = rt_sigaction rt_sigprocmask sigaltstack ppoll ioctl
+allow = clock_gettime nanosleep clock_nanosleep getpid gettid getuid geteuid getgid getegid
+# forwarded to the host (after checks)
+allow = write writev openat read close fstat lseek getrandom
+
+# ---- explicit refusals, with a clear error for the agent ----
+deny socket socketpair bind connect = EACCES    # no network
+deny clone clone3 execve            = EPERM     # no new processes

@@ -1,0 +1,189 @@
+
+################ 1. default policy, normal agent
+VMM: policy policies/default.policy: time 3000 ms, memory 32 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 33 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only)
+     Landlock v7: files limited to <repo>/ch01d-real-agent/workspace (read-only)
+     rlimits: no new processes, no core dumps, 64 open files
+VMM: agent agent/target/aarch64-unknown-linux-musl/release/agent [] (705 KB), entry 0x81027cc0
+
+agent: hello! I'm an ordinary Rust program: std, heap, files, hash maps.
+agent: summed 200,000 numbers on the heap = 20000100000
+agent: word counts: the=3 fox=1
+agent: read /workspace/notes.txt (121 bytes): Q3 numbers: revenue 1.2M, costs 0.9M.
+agent: read ~/.ssh/id_rsa: Permission denied (os error 13)
+agent: escape with /workspace/../etc/passwd: Permission denied (os error 13)
+agent: write a file into /workspace: Permission denied (os error 13)
+agent: connect to 1.1.1.1:443: Permission denied (os error 13)
+agent: start /bin/sh: Function not implemented (os error 38)
+agent: done in 1.684041ms
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   clock_gettime        2      0   
+  ANSWERED   mmap                 5      0   
+  ANSWERED   mprotect             1      0   
+  ANSWERED   munmap               4      0   
+  ANSWERED   ppoll                1      0   
+  ANSWERED   rt_sigaction         5      0   
+  ANSWERED   rt_sigprocmask       3      0   
+  ANSWERED   set_tid_address      1      0   
+  ANSWERED   sigaltstack          3      0   
+  REFUSED    fcntl                1      0   ENOSYS
+  REFUSED    mmap                 1      0   EINVAL
+  REFUSED    openat               3      0   "/home/user/.ssh/id_rsa" -> EACCES, "/workspace/../etc/passwd" -> EACCES, "/workspace/out.txt" -> EACCES
+  REFUSED    pipe2                2      0   ENOSYS
+  REFUSED    socket               1      0   EACCES
+  FORWARDED  close                1      1   
+  FORWARDED  fstat                1      1   
+  FORWARDED  getrandom            1      1   
+  FORWARDED  openat               1      1   "/workspace/notes.txt" -> fd 3
+  FORWARDED  read                 2      2   
+  FORWARDED  write               10     10   
+
+  51 system calls: 27 answered, 8 refused, 16 forwarded. VM exits: 17.
+
+VMM: agent exited with code 0. Total time 21.0 ms (create VM + load + run).
+[exit status 0]
+
+################ 2. strict policy, same agent
+VMM: policy policies/strict.policy: time 1000 ms, memory 8 MB, output 8 KB, open files 0, read []
+VMM: jail: seccomp: 33 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only)
+     Landlock v7: files limited to <repo>/ch01d-real-agent/workspace (read-only)
+     rlimits: no new processes, no core dumps, 64 open files
+VMM: agent agent/target/aarch64-unknown-linux-musl/release/agent [] (705 KB), entry 0x81027cc0
+
+agent: hello! I'm an ordinary Rust program: std, heap, files, hash maps.
+agent: summed 200,000 numbers on the heap = 20000100000
+agent: word counts: the=3 fox=1
+agent: could not read notes: Permission denied (os error 13)
+agent: read ~/.ssh/id_rsa: Permission denied (os error 13)
+agent: escape with /workspace/../etc/passwd: Permission denied (os error 13)
+agent: write a file into /workspace: Permission denied (os error 13)
+agent: connect to 1.1.1.1:443: Permission denied (os error 13)
+agent: start /bin/sh: Function not implemented (os error 38)
+agent: done in 999.917µs
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   clock_gettime        2      0   
+  ANSWERED   mmap                 5      0   
+  ANSWERED   mprotect             1      0   
+  ANSWERED   munmap               4      0   
+  ANSWERED   ppoll                1      0   
+  ANSWERED   rt_sigaction         5      0   
+  ANSWERED   rt_sigprocmask       3      0   
+  ANSWERED   set_tid_address      1      0   
+  ANSWERED   sigaltstack          3      0   
+  REFUSED    mmap                 1      0   EINVAL
+  REFUSED    openat               4      0   "/workspace/notes.txt" -> EACCES, "/home/user/.ssh/id_rsa" -> EACCES, "/workspace/../etc/passwd" -> EACCES, "/workspace/out.txt" -> EACCES
+  REFUSED    pipe2                2      0   ENOSYS
+  REFUSED    socket               1      0   EACCES
+  FORWARDED  getrandom            1      1   
+  FORWARDED  write               10     10   
+
+  46 system calls: 27 answered, 8 refused, 11 forwarded. VM exits: 12.
+
+VMM: agent exited with code 0. Total time 9.6 ms (create VM + load + run).
+[exit status 0]
+
+################ 3. infinite loop -> watchdog
+VMM: policy policies/default.policy: time 3000 ms, memory 32 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 33 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only)
+     Landlock v7: files limited to <repo>/ch01d-real-agent/workspace (read-only)
+     rlimits: no new processes, no core dumps, 64 open files
+VMM: agent agent/target/aarch64-unknown-linux-musl/release/agent ["spin"] (705 KB), entry 0x81027cc0
+
+agent: spinning forever (only a time limit can stop me)
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   mmap                 4      0   
+  ANSWERED   mprotect             1      0   
+  ANSWERED   ppoll                1      0   
+  ANSWERED   rt_sigaction         5      0   
+  ANSWERED   rt_sigprocmask       1      0   
+  ANSWERED   set_tid_address      1      0   
+  ANSWERED   sigaltstack          2      0   
+  REFUSED    mmap                 1      0   EINVAL
+  FORWARDED  write                1      1   
+
+  19 system calls: 17 answered, 1 refused, 1 forwarded. VM exits: 1.
+
+VMM: agent STOPPED: time limit of 3000 ms reached (the watchdog interrupted the vCPU)
+[exit status 2]
+
+################ 4. memory hog -> memory limit
+VMM: policy policies/default.policy: time 3000 ms, memory 32 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 33 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only)
+     Landlock v7: files limited to <repo>/ch01d-real-agent/workspace (read-only)
+     rlimits: no new processes, no core dumps, 64 open files
+VMM: agent agent/target/aarch64-unknown-linux-musl/release/agent ["hog"] (705 KB), entry 0x81027cc0
+
+agent: allocating 1 MB blocks until something stops me
+agent: holding 8 MB
+agent: holding 16 MB
+agent: holding 24 MB
+memory allocation of 1048576 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   mmap                35      0   
+  ANSWERED   mprotect             1      0   
+  ANSWERED   ppoll                1      0   
+  ANSWERED   rt_sigaction         6      0   
+  ANSWERED   rt_sigprocmask       5      0   
+  ANSWERED   set_tid_address      1      0   
+  ANSWERED   sigaltstack          2      0   
+  REFUSED    mmap                 2      0   EINVAL, ENOMEM
+  REFUSED    tkill                2      0   ENOSYS
+  FORWARDED  write                8      8   
+
+  65 system calls: 53 answered, 4 refused, 8 forwarded. VM exits: 9.
+
+VMM: agent STOPPED: write to address 0 (the program crashed itself, e.g. abort() after an allocation failed): class 0x24, address 0x0, instruction 0x8106de70
+[exit status 2]
+
+################ 5. endless output -> output limit
+  REFUSED    mmap                 1      0   EINVAL
+  FORWARDED  write              978    978   
+
+  996 system calls: 17 answered, 1 refused, 978 forwarded. VM exits: 979.
+
+VMM: agent STOPPED: output limit of 64 KB reached
+[exit status 0]
+
+################ 6. jail self-test (the VMM attacks its own jail)
+VMM: policy policies/default.policy: time 3000 ms, memory 32 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 33 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only)
+     Landlock v7: files limited to <repo>/ch01d-real-agent/workspace (read-only)
+     rlimits: no new processes, no core dumps, 64 open files
+VMM: agent agent/target/aarch64-unknown-linux-musl/release/agent [] (705 KB), entry 0x81027cc0
+
+selftest: open("/etc/passwd") from the VMM ...
+selftest:   refused by the host kernel: Permission denied (os error 13)
+selftest: socket() from the VMM: seccomp should kill this process now (exit status 159 = SIGSYS) ...
+[exit status 159]
+
+################ 7. LOAD TEST
+machine: 2 CPUs, 967 MB RAM, 803 MB available
+
+A. cold start (new process + VM + load ELF + supervisor + agent prints + exit), 100 runs, one at a time
+   p50 3.01 ms   p90 3.26 ms   p99 3.44 ms   max 3.82 ms
+
+B. throughput: 256 sandboxes per row (each: start, print, exit)
+   in flight   sandboxes/s   p50 ms   p99 ms   failures
+           1           254     3.25     4.18          0
+           2           372     4.27     9.03          0
+           4           453     7.56    15.04          0
+           8           513    13.14    23.81          0
+          16           534    22.08    36.35          0
+          32           555    35.73    62.51          0
+
+C. density: idle sandboxes (each agent sleeps 150 s); adding 10 at a time, stopping while 200 MB is still free
+   alive   memory used   per sandbox   avg VMM RSS
+      40        672 MB      16.80 MB      18.99 MB
+   reached 40 idle sandboxes in 1.4 s
+   CPU use with 40 idle sandboxes: 0.2% of the machine (measured over 3 s)
+   after killing them all: 804 MB available again (started with 747 MB)
+[exit status 0]

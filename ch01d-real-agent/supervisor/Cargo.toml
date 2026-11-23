@@ -1,0 +1,12 @@
+[package]
+name = "supervisor"
+version = "0.1.0"
+edition = "2024"
+description = "Guest level 0 (EL1): answers, refuses or forwards every system call of the agent"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[profile.dev]
+panic = "abort"

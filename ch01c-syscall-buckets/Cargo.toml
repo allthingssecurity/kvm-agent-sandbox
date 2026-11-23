@@ -1,0 +1,12 @@
+[package]
+name = "syscall-buckets"
+version = "0.1.0"
+edition = "2024"
+description = "Chapter 1c: the supervisor answers, refuses or forwards each system call"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+strip = true
