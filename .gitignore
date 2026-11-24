@@ -4,3 +4,12 @@ target/
 *.elf
 *.bin
 .DS_Store
+ch01d-real-agent/compat/bin/
+ch01d-real-agent/compat/traces/
+ch01d-real-agent/compat/h_uds/
+ch01d-real-agent/compat/h_file/
+ch01d-real-agent/compat/da_sandbox.py
+ch01d-real-agent/compat/h_code_execution_tool.py
+ch01d-real-agent/compat/da_cmds.json
+ch01d-real-agent/compat/hermes_tools_*.py
+ch01d-real-agent/redteam/workspace/

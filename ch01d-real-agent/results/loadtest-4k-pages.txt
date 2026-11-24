@@ -1,31 +1,23 @@
-built: supervisor.bin (    8648 bytes), agent, vmm
-[always] madvise never
-
-VMM: agent exited with code 0. Total time 32.3 ms (create VM + load + run).
-machine: 2 CPUs, 967 MB RAM, 810 MB available
+machine: 2 CPUs, 967 MB RAM, 833 MB available
 
 A. cold start (new process + VM + load ELF + supervisor + agent prints + exit), 100 runs, one at a time
-   p50 5.05 ms   p90 5.61 ms   p99 5.97 ms   max 6.39 ms
+   p50 3.77 ms   p90 4.01 ms   p99 4.51 ms   max 5.15 ms
 
 B. throughput: 256 sandboxes per row (each: start, print, exit)
    in flight   sandboxes/s   p50 ms   p99 ms   failures
-           1           166     4.95    11.84          0
-           2           307     5.55     9.92          0
-           4           322    11.09    18.15          0
-           8           282    23.80    61.39          0
-          16           363    31.77    66.91          0
-          32           359    55.65    94.06          0
+           1           209     4.13     4.87          0
+           2           305     5.55    10.27          0
+           4           345    10.41    18.32          0
+           8           364    19.49    32.51          0
+          16           380    31.39    51.54          0
+          32           385    51.75    94.17          0
 
 C. density: idle sandboxes (each agent sleeps 150 s); adding 10 at a time, stopping while 200 MB is still free
    alive   memory used   per sandbox   avg VMM RSS
-      50        131 MB       2.62 MB       3.84 MB
-     100        313 MB       3.13 MB       3.76 MB
-     150        499 MB       3.33 MB       3.52 MB
-     170        582 MB       3.42 MB       3.79 MB
-   reached 170 idle sandboxes in 5.9 s
-   CPU use with 170 idle sandboxes: 0.2% of the machine (measured over 3 s)
-   after killing them all: 775 MB available again (started with 772 MB)
-[exit status 0]
-VM: Stopped
-
-[exited with code 0]
+      50        128 MB       2.56 MB       3.48 MB
+     100        315 MB       3.15 MB       3.61 MB
+     150        496 MB       3.31 MB       3.23 MB
+     180        601 MB       3.34 MB       3.38 MB
+   reached 180 idle sandboxes in 6.2 s
+   CPU use with 180 idle sandboxes: 0.0% of the machine (measured over 3 s)
+   after killing them all: 787 MB available again (started with 797 MB)

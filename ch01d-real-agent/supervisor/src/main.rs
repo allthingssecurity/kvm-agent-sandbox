@@ -315,7 +315,7 @@ fn mmap(len: u64, flags: u64, fd: i64) -> (u64, i64) {
     if flags & MAP_FIXED != 0 || len == 0 {
         return (REFUSED, -EINVAL);
     }
-    let len = (len + 4095) & !4095;
+    let Some(len) = len.checked_add(4095).map(|l| l & !4095) else { return (REFUSED, -ENOMEM) };
     let start = MMAP_NEXT.load(Relaxed);
     match start.checked_add(len) {
         Some(end) if end <= boot().mmap_end => {
@@ -458,18 +458,28 @@ fn sleep(req: u64) -> (u64, i64) {
 }
 
 // ------------------------------- helpers ------------------------------------------------------
-/// Pointers from the agent are never trusted: they must lie inside the agent's own memory.
-fn user_readable(ptr: u64, len: u64) -> bool {
-    ptr >= AGENT_LO && ptr.checked_add(len).is_some_and(|end| end <= AGENT_HI)
-}
-/// For memory we (or the VMM) write into: heap/mmap/stack, or the program's writable data.
-fn user_writable(ptr: u64, len: u64) -> bool {
-    let b = boot();
+/// Pointers from the agent are never trusted. The rule: the supervisor touches memory for the agent
+/// only if the agent could touch it itself. We don't compare against an address range (it has holes:
+/// unmapped gaps, read-only code, memory beyond the limit); we ask the MMU, with the agent's own page
+/// tables, page by page: AT S1E0R / S1E0W = "translate this as a level-3 read / write".
+fn el0_can(ptr: u64, len: u64, write: bool) -> bool {
     let Some(end) = ptr.checked_add(len) else { return false };
-    (ptr >= b.brk_start && end <= AGENT_HI) || (ptr >= b.rw_lo && end <= b.rw_hi)
+    if ptr < AGENT_LO || end > AGENT_HI { return false; } // cheap first check, also bounds the loop
+    let mut page = ptr & !0xfff;
+    while page < end {
+        let par: u64;
+        unsafe {
+            if write { asm!("at s1e0w, {0}", "isb", "mrs {1}, par_el1", in(reg) page, out(reg) par) }
+            else { asm!("at s1e0r, {0}", "isb", "mrs {1}, par_el1", in(reg) page, out(reg) par) }
+        }
+        if par & 1 != 0 { return false; } // PAR_EL1.F: the translation would fault
+        page += 4096;
+    }
+    true
 }
+fn user_readable(ptr: u64, len: u64) -> bool { el0_can(ptr, len, false) }
+fn user_writable(ptr: u64, len: u64) -> bool { el0_can(ptr, len, true) }
 
-/// Ring the doorbell: the only way out of guest mode. The VMM does the work and writes the result.
 fn hypercall(op: u64, a: u64, b: u64, c: u64) -> i64 {
     unsafe {
         let p = HC_PAGE as *mut u64;

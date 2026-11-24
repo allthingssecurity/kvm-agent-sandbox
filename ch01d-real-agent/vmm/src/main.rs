@@ -58,7 +58,8 @@ const BRK_START: u64 = 0x8200_0000; // heap (brk)
 const BRK_END: u64 = 0x8280_0000;
 const MMAP_START: u64 = 0x8280_0000; // mmap area: its usable size is the policy's memory_mb
 const MMAP_MAX_END: u64 = 0x87c0_0000;
-const STACK_HI: u64 = 0x8800_0000; // stack: 0x87c0_0000 .. 0x8800_0000
+const STACK_LO: u64 = 0x87c0_0000;
+const STACK_HI: u64 = 0x8800_0000; // stack: 4 MiB below this
 const DOORBELL: u64 = 0x0900_0000;
 
 // Page-table entry bits (4 KiB pages).
@@ -248,10 +249,14 @@ fn load_elf(ram: &GuestRam, file: &[u8], perms: &mut [u64]) -> io::Result<Progra
     if file.len() < 64 || &file[0..4] != b"\x7fELF" || file[4] != 2 || file[5] != 1 {
         return Err(err("not a 64-bit little-endian ELF file"));
     }
-    if u16_at(16) != 2 || u16_at(18) != 183 {
-        return Err(err("need a static (ET_EXEC) arm64 executable"));
-    }
-    let (entry, phoff, phentsize, phnum) = (u64_at(24), u64_at(32) as usize, u16_at(54) as usize, u16_at(56));
+    // ET_EXEC: linked for a fixed address. ET_DYN without an interpreter: a "static PIE", the usual
+    // static build today (Alpine, most distributions). We place it at ELF_LO; it relocates itself.
+    let base = match (u16_at(16), u16_at(18)) {
+        (2, 183) => 0,
+        (3, 183) => ELF_LO,
+        _ => return Err(err("need a static arm64 executable (ET_EXEC or static PIE)")),
+    };
+    let (entry, phoff, phentsize, phnum) = (base + u64_at(24), u64_at(32) as usize, u16_at(54) as usize, u16_at(56));
     if phentsize < 56 || phoff.checked_add(phnum as usize * phentsize).is_none_or(|end| end > file.len()) {
         return Err(err("bad program headers"));
     }
@@ -260,6 +265,7 @@ fn load_elf(ram: &GuestRam, file: &[u8], perms: &mut [u64]) -> io::Result<Progra
         let ph = phoff + i * phentsize;
         let (kind, flags, offset, vaddr) = (u32_at(ph), u32_at(ph + 4), u64_at(ph + 8) as usize, u64_at(ph + 16));
         let (filesz, memsz) = (u64_at(ph + 32) as usize, u64_at(ph + 40));
+        let vaddr = vaddr.checked_add(base).ok_or_else(|| err("segment overflows"))?;
         match kind {
             3 => return Err(err("dynamically linked: the agent must be a static binary")),
             1 => {
@@ -557,6 +563,7 @@ fn main() -> io::Result<()> {
         }
     }
     let agent_path = agent_path.unwrap_or_else(|| "agent/target/aarch64-unknown-linux-musl/release/agent".into());
+    agent_args[0] = Path::new(&agent_path).file_name().map_or("agent".into(), |n| n.to_string_lossy().into_owned()); // like a shell
     let policy = parse_policy(&policy_path)?;
     let elf = std::fs::read(&agent_path).map_err(|e| err(format!("{agent_path}: {e}")))?;
     let root = policy.workspace.canonicalize().map_err(|e| err(format!("workspace {}: {e}", policy.workspace.display())))?;
@@ -579,12 +586,18 @@ fn main() -> io::Result<()> {
     let mut perms = vec![0u64; RAM_SIZE / 4096];
     for page in (SUP_LO..SUP_HI).step_by(4096) { perms[((page - RAM_BASE) >> 12) as usize] = NO_EXEC_EL0; } // level 0 only
     let prog = load_elf(&ram, &elf, &mut perms)?;
-    for page in (BRK_START..STACK_HI).step_by(4096) { // heap, mmap area, stack: the agent's, never executable
+    // Heap, the first memory_mb of the mmap area, and the stack: the agent's, never executable. The
+    // rest of the mmap area stays unmapped, so the memory limit holds even against direct stores.
+    let mmap_end = MMAP_START + (policy.memory_mb << 20);
+    for page in (BRK_START..mmap_end).step_by(4096).chain((STACK_LO..STACK_HI).step_by(4096)) {
         perms[((page - RAM_BASE) >> 12) as usize] = EL0_ALLOWED | NO_EXEC_EL0 | NO_EXEC_EL1;
     }
     build_page_tables(&ram, &perms);
     let sp = build_stack(&ram, &prog, &agent_args)?;
-    let mmap_end = MMAP_START + (policy.memory_mb << 20);
+    // Wall 3 doesn't trust the supervisor's pointer checks either: forwarded results only ever land
+    // in, and output only ever comes from, the agent's own areas.
+    let agent_mem = |gpa: u64, len: u64| gpa.checked_add(len).is_some_and(|end|
+        (gpa >= ELF_LO && end <= mmap_end) || (gpa >= STACK_LO && end <= STACK_HI));
     for (i, v) in [prog.entry, sp, BRK_START, BRK_END, MMAP_START, mmap_end, prog.rw_lo, prog.rw_hi].into_iter().enumerate() {
         ram.write_u64(BOOT_INFO + i as u64 * 8, v);
     }
@@ -629,7 +642,7 @@ fn main() -> io::Result<()> {
         let req = |i: u64| ram.read_u64(HC_PAGE + 8 * i);
         let (op, a, b, c) = (req(0), req(1), req(2), req(3));
         let result: i64 = match op {
-            HC_WRITE => match ram.slice(a, b) {
+            HC_WRITE => match ram.slice(a, b).filter(|_| agent_mem(a, b)) {
                 Some(bytes) => {
                     let room = policy.max_output.saturating_sub(printed) as usize;
                     out.write_all(&bytes[..bytes.len().min(room)])?;
@@ -644,7 +657,7 @@ fn main() -> io::Result<()> {
                 None => -errno("EFAULT"),
             },
             HC_OPEN => files.open(&ram.c_string(HC_TEXT)),
-            HC_READ => match (files.get(a), ram.slice_mut(b, c)) {
+            HC_READ => match (files.get(a), ram.slice_mut(b, c).filter(|_| agent_mem(b, c))) {
                 (Some(f), Some(buf)) => f.read(buf).map(|n| n as i64).unwrap_or(-errno("EBADF")),
                 (None, _) => -errno("EBADF"),
                 (_, None) => -errno("EFAULT"),
@@ -653,7 +666,7 @@ fn main() -> io::Result<()> {
                 Some(_) => 0,
                 None => -errno("EBADF"),
             },
-            HC_FSTAT => match (files.get(a), ram.slice_mut(b, 128)) {
+            HC_FSTAT => match (files.get(a), ram.slice_mut(b, 128).filter(|_| agent_mem(b, 128))) {
                 (Some(f), Some(buf)) => {
                     let mut st: libc::stat = unsafe { std::mem::zeroed() };
                     if unsafe { libc::fstat(f.as_raw_fd(), &mut st) } != 0 { -errno("EBADF") } else {
@@ -675,7 +688,7 @@ fn main() -> io::Result<()> {
                 }
                 None => -errno("EBADF"),
             },
-            HC_GETRANDOM => match ram.slice_mut(a, b) {
+            HC_GETRANDOM => match ram.slice_mut(a, b).filter(|_| agent_mem(a, b)) {
                 Some(buf) => { host_random(buf)?; b as i64 }
                 None => -errno("EFAULT"),
             },

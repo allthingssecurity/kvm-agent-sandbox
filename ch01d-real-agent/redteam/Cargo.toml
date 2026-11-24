@@ -1,0 +1,8 @@
+[package]
+name = "redteam"
+version = "0.1.0"
+edition = "2024"
+description = "Attacks the sandbox from inside: what a prompt-injected agent tool would try."
+
+[profile.release]
+opt-level = "s"

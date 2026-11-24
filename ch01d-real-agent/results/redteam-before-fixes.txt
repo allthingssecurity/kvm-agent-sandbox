@@ -1,0 +1,125 @@
+################ 1. attacks that must come back as errors
+-- steal host secrets
+PASS  open /etc/passwd                                           got -13          want EACCES
+PASS  open /etc/shadow                                           got -13          want EACCES
+PASS  open /root/.ssh/id_rsa                                     got -13          want EACCES
+PASS  open /home/user/.aws/credentials                           got -13          want EACCES
+PASS  open /proc/self/environ                                    got -13          want EACCES
+PASS  open /proc/self/mem                                        got -13          want EACCES
+PASS  open /proc/1/root/etc/passwd                               got -13          want EACCES
+PASS  open /dev/kvm                                              got -13          want EACCES
+PASS  open /                                                     got -13          want EACCES
+-- escape the workspace
+PASS  open /workspace/../etc/passwd                              got -13          want EACCES
+PASS  open /workspace/./../../etc/passwd                         got -13          want EACCES
+PASS  open /workspace//etc/passwd (absolute path after prefix)   got -13          want EACCES
+PASS  open /workspace/escape-link (symlink -> /etc/passwd)       got -13          want EACCES
+PASS  open /workspace/etc-link/passwd (symlink -> /etc)          got -13          want EACCES
+PASS  open /workspaceX/notes.txt (prefix confusion)              got -13          want an error
+PASS  open a 311-byte path                                       got -36          want ENAMETOOLONG
+-- write, create, persist
+PASS  open notes.txt O_WRONLY                                    got -13          want EACCES
+PASS  open notes.txt O_RDWR                                      got -13          want EACCES
+PASS  open notes.txt O_WRONLY|O_CREAT|O_TRUNC                    got -13          want EACCES
+PASS  open notes.txt O_WRONLY|O_APPEND                           got -13          want EACCES
+PASS  mkdirat                                                    got -38          want ENOSYS
+PASS  unlinkat                                                   got -38          want ENOSYS
+PASS  symlinkat                                                  got -38          want ENOSYS
+PASS  linkat                                                     got -38          want ENOSYS
+PASS  renameat                                                   got -38          want ENOSYS
+PASS  fchmodat                                                   got -38          want ENOSYS
+PASS  fchownat                                                   got -38          want ENOSYS
+-- network (exfiltration, Hermes' socket RPC)
+PASS  socket(AF_INET, SOCK_STREAM)                               got -13          want EACCES
+PASS  socket(AF_UNIX, SOCK_STREAM)                               got -13          want EACCES
+PASS  connect                                                    got -13          want EACCES
+PASS  socketpair                                                 got -13          want EACCES
+-- start programs, fork bombs
+PASS  clone(SIGCHLD)  (fork)                                     got -1           want EPERM
+PASS  clone3                                                     got -1           want EPERM
+PASS  execve /bin/sh                                             got -1           want EPERM
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   mmap                 3      0   
+  ANSWERED   mprotect             1      0   
+  ANSWERED   ppoll                1      0   
+  ANSWERED   rt_sigaction         5      0   
+  ANSWERED   rt_sigprocmask       1      0   
+  ANSWERED   set_tid_address      1      0   
+  ANSWERED   sigaltstack          2      0   
+  REFUSED    #34                  1      0   ENOSYS
+  REFUSED    #35                  1      0   ENOSYS
+  REFUSED    #36                  1      0   ENOSYS
+  REFUSED    #37                  1      0   ENOSYS
+  REFUSED    #38                  1      0   ENOSYS
+  REFUSED    #53                  1      0   ENOSYS
+  REFUSED    #54                  1      0   ENOSYS
+  REFUSED    clone             9911      0   EPERM
+  REFUSED    clone3               1      0   EPERM
+  REFUSED    connect              1      0   EACCES
+  REFUSED    execve               1      0   EPERM
+  REFUSED    mmap                 1      0   EINVAL
+  REFUSED    openat              17      0   "/etc/passwd" -> EACCES, "/etc/shadow" -> EACCES, "/root/.ssh/id_rsa" -> EACCES, "/home/user/.aws/credentials" -> EACCES
+  REFUSED    socket               2      0   EACCES
+  REFUSED    socketpair           1      0   EACCES
+  FORWARDED  openat               3      3   "/workspace//etc/passwd" -> EACCES, "/workspace/escape-link" -> EACCES, "/workspace/etc-link/passwd" -> EACCES
+  FORWARDED  write               39     39   
+
+  10000 system calls: 16 answered, 9942 refused, 42 forwarded. VM exits: 43.
+
+VMM: agent STOPPED: the audit log is full (no unlogged system calls allowed)
+
+################ 2. attacks that must stop the sandbox
+PASS  read-policy                memory access it isn't allowed: class 0x24, address 0x80120000, instruction 0x810260cc
+PASS  erase-audit-log            memory access it isn't allowed: class 0x24, address 0x80400000, instruction 0x81026238
+PASS  edit-page-tables           memory access it isn't allowed: class 0x24, address 0x80200000, instruction 0x81026238
+PASS  patch-own-code             memory access it isn't allowed: class 0x24, address 0x81025ff4, instruction 0x810261c0
+PASS  ring-doorbell              memory access it isn't allowed: class 0x24, address 0x9000000, instruction 0x810265f8
+PASS  touch-outside-ram          memory access it isn't allowed: class 0x24, address 0x40000000, instruction 0x81026280
+PASS  zero-audit-log-dczva       memory access it isn't allowed: class 0x24, address 0x80400000, instruction 0x81026368
+FAIL  beyond-memory-limit
+        redteam: attack 'beyond-memory-limit'
+        redteam: wrote to 0x84900000, past the memory limit, and read back 42
+        redteam: touched 83 MiB without asking for it
+        redteam: SURVIVED: attack 'beyond-memory-limit' was not stopped
+        VMM: agent STOPPED: memory access it isn't allowed: class 0x24, address 0x11, instruction 0x81065478
+FAIL  stack-overflow
+        redteam: attack 'stack-overflow'
+        VMM: agent STOPPED: time limit of 2000 ms reached (the watchdog interrupted the vCPU)
+PASS  run-supervisor-code        jump into memory it may not run: class 0x20, address 0x80000000, instruction 0x80000000
+PASS  run-from-heap              jump into memory it may not run: class 0x20, address 0x82804250, instruction 0x82804250
+PASS  run-from-stack             jump into memory it may not run: class 0x20, address 0x87fffa80, instruction 0x87fffa80
+PASS  set-vector-table           illegal instruction (the program crashed itself): class 0x0, address 0x1de7ec7edbadc0de, instruction 0x810264e4
+PASS  read-page-table-register   illegal instruction (the program crashed itself): class 0x0, address 0x1de7ec7edbadc0de, instruction 0x810263b8
+PASS  turn-off-mmu               illegal instruction (the program crashed itself): class 0x0, address 0x1de7ec7edbadc0de, instruction 0x81026108
+PASS  hypervisor-call            illegal instruction (the program crashed itself): class 0x0, address 0x1de7ec7edbadc0de, instruction 0x810264a8
+PASS  firmware-call              illegal instruction (the program crashed itself): class 0x0, address 0x1de7ec7edbadc0de, instruction 0x81026404
+PASS  eret                       illegal instruction (the program crashed itself): class 0x0, address 0x1de7ec7edbadc0de, instruction 0x810263c8
+PASS  wait-for-interrupt         time limit of 2000 ms reached (the watchdog interrupted the vCPU)
+PASS  sleep-an-hour              time limit of 2000 ms reached (while sleeping)
+PASS  spin                       time limit of 2000 ms reached (the watchdog interrupted the vCPU)
+19 passed, 2 failed
+
+################ 3. fuzzing: random system calls with hostile arguments
+      1 
+      1 Error: Custom { kind: Other, error: "supervisor fault:  (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 Error: Custom { kind: Other, error: "supervisor fault:  (esr 0x96000007, pc 0x80001b5c, address 0x81f00000)" }
+      9 Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      2 Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x80001b5c, address 0x81f00000)" }
+      1 FAIL seed 1 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 13 (exit 1): 
+      1 FAIL seed 14 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 17 (exit 1): Error: Custom { kind: Other, error: "supervisor fault:  (esr 0x96000007, pc 0x80001b5c, address 0x81f00000)" }
+      1 FAIL seed 18 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x80001b5c, address 0x81f00000)" }
+      1 FAIL seed 19 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 2 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 20 (exit 1): Error: Custom { kind: Other, error: "supervisor fault:  (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 3 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 5 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 6 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 7 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 8 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x800012b0, address 0x81f00000)" }
+      1 FAIL seed 9 (exit 1): Error: Custom { kind: Other, error: "supervisor fault: /workspace/notes.txt (esr 0x96000007, pc 0x80001b5c, address 0x81f00000)" }
+      6 supervisor still answering
+(20 runs x 5000 calls; a run fails only on a supervisor crash, a VMM error or a hang)
