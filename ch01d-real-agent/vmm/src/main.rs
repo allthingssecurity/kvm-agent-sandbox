@@ -43,7 +43,7 @@ const REG_PC: u64 = 0x6030_0000_0010_0000 | (256 / 4);
 
 // ------------------------------- guest memory map (must match supervisor/src/main.rs) ---------
 const RAM_BASE: u64 = 0x8000_0000;
-const RAM_SIZE: usize = 128 << 20; // 128 MiB, allocated lazily by the host as it is touched
+const RAM_SIZE: usize = 256 << 20; // 256 MiB of address space; the host allocates a page only when it is touched
 const BOOT_INFO: u64 = 0x8010_0000;
 const HC_PAGE: u64 = 0x8011_0000;
 const HC_TEXT: u64 = HC_PAGE + 64;
@@ -60,6 +60,8 @@ const MMAP_START: u64 = 0x8280_0000; // mmap area: its usable size is the policy
 const MMAP_MAX_END: u64 = 0x87c0_0000;
 const STACK_LO: u64 = 0x87c0_0000;
 const STACK_HI: u64 = 0x8800_0000; // stack: 4 MiB below this
+const TMP_LO: u64 = 0x8800_0000; // /tmp's file data: supervisor-only memory, the policy's tmp_kb of it
+const TMP_MAX_HI: u64 = 0x9000_0000;
 const DOORBELL: u64 = 0x0900_0000;
 
 // Page-table entry bits (4 KiB pages).
@@ -89,20 +91,34 @@ const HC_GETRANDOM: u64 = 9;
 const HC_FAULT: u64 = 10;
 const HC_LOG_FULL: u64 = 11;
 const HC_SLEEP: u64 = 12;
+const HC_STAT: u64 = 13;
+const HC_READLINK: u64 = 14;
+const HC_GETDENTS: u64 = 15;
 
 /// Linux arm64 system call numbers, for policies and reports.
 const SYSCALLS: &[(&str, u64)] = &[
-    ("fcntl", 25), ("ioctl", 29), ("openat", 56), ("close", 57), ("pipe2", 59), ("lseek", 62), ("read", 63),
-    ("write", 64), ("writev", 66), ("ppoll", 73), ("fstat", 80), ("exit", 93), ("exit_group", 94),
-    ("set_tid_address", 96), ("futex", 98), ("nanosleep", 101), ("clock_gettime", 113), ("clock_nanosleep", 115), ("tkill", 130), ("sigaltstack", 132),
-    ("rt_sigaction", 134), ("rt_sigprocmask", 135), ("getpid", 172), ("getuid", 174), ("geteuid", 175),
-    ("getgid", 176), ("getegid", 177), ("gettid", 178), ("socket", 198), ("socketpair", 199), ("bind", 200),
-    ("connect", 203), ("brk", 214), ("munmap", 215), ("mremap", 216), ("clone", 220), ("execve", 221),
-    ("mmap", 222), ("mprotect", 226), ("madvise", 233), ("getrandom", 278), ("statx", 291), ("clone3", 435),
+    ("getcwd", 17), ("dup", 23), ("dup3", 24), ("fcntl", 25), ("ioctl", 29), ("mkdirat", 34), ("unlinkat", 35),
+    ("symlinkat", 36), ("linkat", 37), ("renameat", 38), ("ftruncate", 46), ("faccessat", 48), ("chdir", 49),
+    ("fchdir", 50), ("openat", 56), ("close", 57), ("pipe2", 59), ("getdents64", 61), ("lseek", 62), ("read", 63),
+    ("write", 64), ("readv", 65), ("writev", 66), ("sendfile", 71), ("ppoll", 73), ("readlinkat", 78),
+    ("newfstatat", 79), ("fstat", 80), ("fsync", 82), ("fdatasync", 83), ("exit", 93), ("exit_group", 94),
+    ("set_tid_address", 96), ("futex", 98), ("nanosleep", 101), ("clock_gettime", 113), ("clock_nanosleep", 115), ("sched_getaffinity", 123), ("sched_yield", 124),
+    ("kill", 129), ("tkill", 130), ("tgkill", 131), ("sigaltstack", 132), ("rt_sigaction", 134),
+    ("rt_sigprocmask", 135), ("rt_sigreturn", 139), ("setgid", 144), ("setuid", 146), ("getresuid", 148),
+    ("getresgid", 150), ("setpgid", 154), ("getpgid", 155), ("setsid", 157), ("getgroups", 158), ("uname", 160), ("getrlimit", 163),
+    ("getrusage", 165), ("umask", 166), ("getpid", 172), ("getppid", 173), ("getuid", 174), ("geteuid", 175), ("getgid", 176),
+    ("getegid", 177), ("gettid", 178), ("sysinfo", 179), ("socket", 198), ("socketpair", 199), ("bind", 200), ("connect", 203),
+    ("brk", 214), ("munmap", 215), ("mremap", 216), ("clone", 220), ("execve", 221), ("mmap", 222),
+    ("mprotect", 226), ("madvise", 233), ("wait4", 260), ("prlimit64", 261), ("renameat2", 276),
+    ("getrandom", 278), ("statx", 291), ("clone3", 435), ("faccessat2", 439),
 ];
+/// System calls whose notebook entry carries a path (the supervisor logs its copy).
+const PATH_CALLS: &[u64] = &[34, 35, 38, 48, 49, 56, 78, 79, 276, 439];
 const ERRNOS: &[(&str, i64)] = &[
     ("EPERM", 1), ("ENOENT", 2), ("EBADF", 9), ("ENOMEM", 12), ("EACCES", 13), ("EFAULT", 14), ("EINVAL", 22),
-    ("EMFILE", 24), ("ENOTTY", 25), ("ENAMETOOLONG", 36), ("ENOSYS", 38),
+    ("EMFILE", 24), ("ENOTTY", 25), ("ENAMETOOLONG", 36), ("ENOSYS", 38), ("ESRCH", 3), ("EEXIST", 17),
+    ("ENOTDIR", 20), ("EISDIR", 21), ("ENOSPC", 28), ("ESPIPE", 29), ("EROFS", 30), ("ERANGE", 34),
+    ("ENOTEMPTY", 39), ("EBUSY", 16), ("EFBIG", 27), ("ELOOP", 40),
 ];
 fn errno(name: &str) -> i64 { ERRNOS.iter().find(|e| e.0 == name).map(|e| e.1).unwrap() }
 
@@ -166,6 +182,7 @@ impl GuestRam {
 struct Policy {
     time_limit: Duration,
     memory_mb: u64,
+    tmp_kb: u64,
     max_output: u64,
     max_open_files: usize,
     workspace: PathBuf,
@@ -178,7 +195,7 @@ struct Policy {
 fn parse_policy(path: &str) -> io::Result<Policy> {
     let text = std::fs::read_to_string(path).map_err(|e| err(format!("{path}: {e}")))?;
     let mut p = Policy {
-        time_limit: Duration::from_millis(5000), memory_mb: 32, max_output: 64 << 10, max_open_files: 8,
+        time_limit: Duration::from_millis(5000), memory_mb: 32, tmp_kb: 0, max_output: 64 << 10, max_open_files: 8,
         workspace: PathBuf::from("./workspace"), read: Vec::new(), actions: [0; 512], errnos: [0; 512],
     };
     let number = |name: &str| SYSCALLS.iter().find(|s| s.0 == name).map(|s| s.1 as usize);
@@ -201,6 +218,7 @@ fn parse_policy(path: &str) -> io::Result<Policy> {
         match key {
             "time_limit_ms" => p.time_limit = Duration::from_millis(num()?),
             "memory_mb" => p.memory_mb = num()?,
+            "tmp_kb" => p.tmp_kb = num()?,
             "max_output_kb" => p.max_output = num()? << 10,
             "max_open_files" => p.max_open_files = num()? as usize,
             "workspace" => p.workspace = PathBuf::from(value),
@@ -221,6 +239,9 @@ fn parse_policy(path: &str) -> io::Result<Policy> {
     }
     if p.memory_mb << 20 > MMAP_MAX_END - MMAP_START {
         return Err(err(format!("{path}: memory_mb is at most {}", (MMAP_MAX_END - MMAP_START) >> 20)));
+    }
+    if p.tmp_kb << 10 > TMP_MAX_HI - TMP_LO {
+        return Err(err(format!("{path}: tmp_kb is at most {}", (TMP_MAX_HI - TMP_LO) >> 10)));
     }
     Ok(p)
 }
@@ -327,11 +348,13 @@ fn build_page_tables(ram: &GuestRam, perms: &[u64]) {
     entry(l1, 0, l2_low | TABLE);
     entry(l1, RAM_BASE >> 30, l2_ram | TABLE);
     entry(l2_low, DOORBELL >> 21, DOORBELL | BLOCK | DEVICE | ACCESSED | NO_EXEC_EL0 | NO_EXEC_EL1);
-    for (i, &bits) in perms.iter().enumerate() {
-        let (table, index) = (l3_first + (i as u64 / 512) * 0x1000, i as u64 % 512);
-        if i % 512 == 0 { entry(l2_ram, i as u64 / 512, table | TABLE); }
-        if bits != 0 {
-            entry(table, index, (RAM_BASE + i as u64 * 4096) | PAGE | INNER_SHAREABLE | ACCESSED | bits);
+    for (t, chunk) in perms.chunks(512).enumerate() {
+        if chunk.iter().all(|&bits| bits == 0) { continue; } // nothing mapped in these 2 MiB: no table at all
+        let table = l3_first + t as u64 * 0x1000;
+        entry(l2_ram, t as u64, table | TABLE);
+        for (index, &bits) in chunk.iter().enumerate().filter(|(_, b)| **b != 0) {
+            let page = (t * 512 + index) as u64;
+            entry(table, index as u64, (RAM_BASE + page * 4096) | PAGE | INNER_SHAREABLE | ACCESSED | bits);
         }
     }
 }
@@ -339,30 +362,95 @@ fn build_page_tables(ram: &GuestRam, perms: &[u64]) {
 // ------------------------------- the host side of forwarded calls -----------------------------
 /// The agent sees "/workspace/..."; on the host that is the policy's workspace folder. The
 /// supervisor checked the path already; we check again with the same policy and don't rely on it.
-struct Files { root: PathBuf, read: Vec<String>, max_open: usize, open: Vec<Option<File>> }
+struct OpenFile { file: File, listing: Option<(Vec<(Vec<u8>, u64, u8)>, usize)> } // folder: entries + position
+struct Files { root: PathBuf, read: Vec<String>, max_open: usize, open: Vec<Option<OpenFile>> }
+fn io_errno(e: &io::Error) -> i64 { -(e.raw_os_error().unwrap_or(2) as i64) }
 impl Files {
-    fn open(&mut self, guest_path: &str) -> i64 {
-        if !self.read.iter().any(|p| guest_path.starts_with(p.as_str())) { return -errno("EACCES"); }
-        let Some(rest) = guest_path.strip_prefix("/workspace/") else { return -errno("EACCES") };
-        if rest.split('/').any(|p| p == "..") { return -errno("EACCES"); }
-        if self.open.iter().flatten().count() >= self.max_open { return -errno("EMFILE"); }
-        let Ok(full) = self.root.join(rest).canonicalize() else { return -errno("ENOENT") };
-        if !full.starts_with(&self.root) { return -errno("EACCES"); }
-        match File::open(&full) {
-            Ok(f) => { self.open.push(Some(f)); 2 + self.open.len() as i64 }
-            Err(_) => -errno("ENOENT"),
+    /// Guest path -> host path. The supervisor sent a clean path; we check it again anyway.
+    fn host_path(&self, guest: &str) -> Result<PathBuf, i64> {
+        if !self.read.iter().any(|p| guest.starts_with(p.as_str()) || p.strip_suffix('/') == Some(guest)) {
+            return Err(-errno("EACCES"));
+        }
+        let rest = if guest == "/workspace" { "" } else { guest.strip_prefix("/workspace/").ok_or(-errno("EACCES"))? };
+        if !rest.is_empty() && rest.split('/').any(|p| p.is_empty() || p == "." || p == "..") { return Err(-errno("EACCES")); }
+        Ok(self.root.join(rest))
+    }
+    /// Follow symbolic links, then insist the result is still inside the workspace.
+    fn inside(&self, full: &Path) -> Result<PathBuf, i64> {
+        let real = full.canonicalize().map_err(|e| io_errno(&e))?;
+        if real.starts_with(&self.root) { Ok(real) } else { Err(-errno("EACCES")) }
+    }
+    /// For lstat and readlink: the last part is not followed, but its folder must be inside.
+    fn inside_nofollow(&self, full: &Path) -> Result<PathBuf, i64> {
+        match (full.parent(), full.file_name()) {
+            (Some(dir), Some(name)) if full != self.root => Ok(self.inside(dir)?.join(name)),
+            _ => self.inside(full),
         }
     }
-    fn get(&mut self, fd: u64) -> Option<&mut File> {
+    fn open(&mut self, guest: &str, want_dir: bool) -> i64 {
+        let real = match self.host_path(guest).and_then(|f| self.inside(&f)) { Ok(r) => r, Err(e) => return e };
+        if self.open.iter().flatten().count() >= self.max_open { return -errno("EMFILE"); }
+        let file = match File::open(&real) { Ok(f) => f, Err(e) => return io_errno(&e) };
+        let is_dir = file.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        if want_dir && !is_dir { return -errno("ENOTDIR"); }
+        let listing = if is_dir {
+            use std::os::unix::fs::DirEntryExt;
+            let mut entries = vec![(b".".to_vec(), 1, 4), (b"..".to_vec(), 1, 4)];
+            match std::fs::read_dir(&real) {
+                Ok(dir) => for e in dir.flatten() {
+                    let kind = e.file_type().map(|t| if t.is_dir() { 4 } else if t.is_symlink() { 10 } else if t.is_file() { 8 } else { 0 }).unwrap_or(0);
+                    entries.push((e.file_name().as_bytes().to_vec(), e.ino(), kind));
+                },
+                Err(e) => return io_errno(&e),
+            }
+            Some((entries, 0))
+        } else { None };
+        self.open.push(Some(OpenFile { file, listing }));
+        (2 + self.open.len() as i64) | ((is_dir as i64) << 32)
+    }
+    fn get(&mut self, fd: u64) -> Option<&mut OpenFile> {
         fd.checked_sub(3).and_then(|i| self.open.get_mut(i as usize)).and_then(|f| f.as_mut())
     }
+}
+
+/// Linux's arm64 `struct stat`, with host details hidden: owner, device and link counts are made up.
+fn stat_bytes(m: &std::fs::Metadata) -> [u8; 128] {
+    use std::os::unix::fs::MetadataExt;
+    let mut b = [0u8; 128];
+    let mut put = |off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
+    put(0, &1u64.to_le_bytes()); put(8, &m.ino().to_le_bytes()); put(16, &m.mode().to_le_bytes());
+    put(20, &(if m.is_dir() { 2u32 } else { 1 }).to_le_bytes()); put(24, &1000u32.to_le_bytes()); put(28, &1000u32.to_le_bytes());
+    put(48, &m.size().to_le_bytes()); put(56, &4096u32.to_le_bytes()); put(64, &m.size().div_ceil(512).to_le_bytes());
+    for (off, t, ns) in [(72, m.atime(), m.atime_nsec()), (88, m.mtime(), m.mtime_nsec()), (104, m.ctime(), m.ctime_nsec())] {
+        put(off, &t.to_le_bytes()); put(off + 8, &ns.to_le_bytes());
+    }
+    b
+}
+
+/// Folder entries as Linux's `struct linux_dirent64` records; returns the bytes written.
+fn dirents(entries: &[(Vec<u8>, u64, u8)], pos: &mut usize, out: &mut [u8]) -> i64 {
+    let mut used = 0;
+    while let Some((name, ino, kind)) = entries.get(*pos) {
+        let reclen = (19 + name.len() + 1 + 7) & !7;
+        if used + reclen > out.len() { return if used == 0 { -errno("EINVAL") } else { used as i64 }; }
+        let r = &mut out[used..used + reclen];
+        r.fill(0);
+        r[0..8].copy_from_slice(&ino.to_le_bytes());
+        r[8..16].copy_from_slice(&(*pos as u64 + 1).to_le_bytes());
+        r[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        r[18] = *kind;
+        r[19..19 + name.len()].copy_from_slice(name);
+        used += reclen;
+        *pos += 1;
+    }
+    used as i64
 }
 
 // ------------------------------- wall 3: jail this VMM process --------------------------------
 /// Host system calls this VMM still needs once the agent runs. Everything else kills the VMM.
 const VMM_SYSCALLS: &[u32] = &[
     17,                // getcwd
-    56, 57, 62, 63,    // openat (limited by Landlock), close, lseek, read
+    56, 57, 61, 62, 63, // openat (limited by Landlock), close, getdents64 (folders), lseek, read
     78, 79, 80, 291,   // readlinkat (canonicalize), newfstatat, fstat, statx
     93, 94,            // exit, exit_group
     98, 101, 113, 115, 124, // futex, nanosleep, clock_gettime, clock_nanosleep, sched_yield
@@ -523,8 +611,8 @@ fn print_notebook(ram: &GuestRam, exits: u64) {
         let (kind, nr, a1, res) = (f[0], f[1], f[3], f[5] as i64);
         let (bucket, detail) = match kind {
             5 => (0u8, None),
-            2 => (1, Some(if nr == 56 { format!("\"{}\" -> {}", ram.c_string(a1), errno_name(res)) } else { errno_name(res) })),
-            1 => (2, (nr == 56).then(|| format!("\"{}\" -> {}", ram.c_string(a1), if res < 0 { errno_name(res) } else { format!("fd {res}") }))),
+            2 => (1, Some(if PATH_CALLS.contains(&nr) { format!("\"{}\" -> {}", ram.c_string(a1), errno_name(res)) } else { errno_name(res) })),
+            1 => (2, PATH_CALLS.contains(&nr).then(|| format!("\"{}\" -> {}", ram.c_string(a1), if res < 0 { errno_name(res) } else if nr == 56 { format!("fd {}", res & 0xffff_ffff) } else { "ok".into() }))),
             _ => continue,
         };
         totals[bucket as usize] += 1;
@@ -592,13 +680,17 @@ fn main() -> io::Result<()> {
     for page in (BRK_START..mmap_end).step_by(4096).chain((STACK_LO..STACK_HI).step_by(4096)) {
         perms[((page - RAM_BASE) >> 12) as usize] = EL0_ALLOWED | NO_EXEC_EL0 | NO_EXEC_EL1;
     }
+    let tmp_hi = TMP_LO + ((policy.tmp_kb << 10).div_ceil(4096) * 4096);
+    for page in (TMP_LO..tmp_hi).step_by(4096) { // /tmp's data: level 0 only, never executable
+        perms[((page - RAM_BASE) >> 12) as usize] = NO_EXEC_EL0 | NO_EXEC_EL1;
+    }
     build_page_tables(&ram, &perms);
     let sp = build_stack(&ram, &prog, &agent_args)?;
     // Wall 3 doesn't trust the supervisor's pointer checks either: forwarded results only ever land
     // in, and output only ever comes from, the agent's own areas.
     let agent_mem = |gpa: u64, len: u64| gpa.checked_add(len).is_some_and(|end|
         (gpa >= ELF_LO && end <= mmap_end) || (gpa >= STACK_LO && end <= STACK_HI));
-    for (i, v) in [prog.entry, sp, BRK_START, BRK_END, MMAP_START, mmap_end, prog.rw_lo, prog.rw_hi].into_iter().enumerate() {
+    for (i, v) in [prog.entry, sp, BRK_START, BRK_END, MMAP_START, mmap_end, prog.rw_lo, prog.rw_hi, TMP_LO, tmp_hi].into_iter().enumerate() {
         ram.write_u64(BOOT_INFO + i as u64 * 8, v);
     }
 
@@ -656,9 +748,10 @@ fn main() -> io::Result<()> {
                 }
                 None => -errno("EFAULT"),
             },
-            HC_OPEN => files.open(&ram.c_string(HC_TEXT)),
+            HC_OPEN => files.open(&ram.c_string(HC_TEXT), b != 0),
             HC_READ => match (files.get(a), ram.slice_mut(b, c).filter(|_| agent_mem(b, c))) {
-                (Some(f), Some(buf)) => f.read(buf).map(|n| n as i64).unwrap_or(-errno("EBADF")),
+                (Some(f), Some(buf)) if f.listing.is_none() => f.file.read(buf).map(|n| n as i64).unwrap_or_else(|e| io_errno(&e)),
+                (Some(_), Some(_)) => -errno("EISDIR"),
                 (None, _) => -errno("EBADF"),
                 (_, None) => -errno("EFAULT"),
             },
@@ -667,24 +760,48 @@ fn main() -> io::Result<()> {
                 None => -errno("EBADF"),
             },
             HC_FSTAT => match (files.get(a), ram.slice_mut(b, 128).filter(|_| agent_mem(b, 128))) {
-                (Some(f), Some(buf)) => {
-                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                    if unsafe { libc::fstat(f.as_raw_fd(), &mut st) } != 0 { -errno("EBADF") } else {
-                        // Hide host details from the agent: keep only type, permissions and size.
-                        let mut clean: libc::stat = unsafe { std::mem::zeroed() };
-                        (clean.st_mode, clean.st_size, clean.st_blksize, clean.st_nlink) = (st.st_mode, st.st_size, 4096, 1);
-                        let raw = unsafe { std::slice::from_raw_parts(&clean as *const _ as *const u8, std::mem::size_of::<libc::stat>().min(128)) };
-                        buf[..raw.len()].copy_from_slice(raw);
-                        0
+                (Some(f), Some(buf)) => match f.file.metadata() { Ok(m) => { buf.copy_from_slice(&stat_bytes(&m)); 0 } Err(e) => io_errno(&e) },
+                (None, _) => -errno("EBADF"),
+                (_, None) => -errno("EFAULT"),
+            },
+            HC_STAT => { // a = the path (in the doorbell page), b = where to put it (0: just the type), c = don't follow
+                let guest = ram.c_string(HC_TEXT);
+                let found = files.host_path(&guest).and_then(|f| if c != 0 { files.inside_nofollow(&f) } else { files.inside(&f) })
+                    .and_then(|real| if c != 0 { std::fs::symlink_metadata(&real) } else { std::fs::metadata(&real) }.map_err(|e| io_errno(&e)));
+                match (found, b) {
+                    (Err(e), _) => e,
+                    (Ok(m), 0) => { use std::os::unix::fs::MetadataExt; m.mode() as i64 }
+                    (Ok(m), _) => match ram.slice_mut(b, 128).filter(|_| agent_mem(b, 128)) {
+                        Some(buf) => { buf.copy_from_slice(&stat_bytes(&m)); { use std::os::unix::fs::MetadataExt; m.mode() as i64 } }
+                        None => -errno("EFAULT"),
+                    },
+                }
+            }
+            HC_READLINK => {
+                let guest = ram.c_string(HC_TEXT);
+                match files.host_path(&guest).and_then(|f| files.inside_nofollow(&f)).and_then(|r| std::fs::read_link(r).map_err(|e| io_errno(&e))) {
+                    Err(e) => e,
+                    Ok(target) => {
+                        let t = target.as_os_str().as_bytes();
+                        let n = t.len().min(c as usize) as u64;
+                        match ram.slice_mut(b, n).filter(|_| agent_mem(b, n)) {
+                            Some(buf) => { buf.copy_from_slice(&t[..n as usize]); n as i64 }
+                            None => -errno("EFAULT"),
+                        }
                     }
                 }
+            }
+            HC_GETDENTS => match (files.get(a), ram.slice_mut(b, c).filter(|_| agent_mem(b, c))) {
+                (Some(OpenFile { listing: Some((entries, pos)), .. }), Some(buf)) => dirents(entries, pos, buf),
+                (Some(_), Some(_)) => -errno("ENOTDIR"),
                 (None, _) => -errno("EBADF"),
                 (_, None) => -errno("EFAULT"),
             },
             HC_LSEEK => match files.get(a) {
+                Some(OpenFile { listing: Some((_, pos)), .. }) => if b == 0 && c == 0 { *pos = 0; 0 } else { -errno("EINVAL") }, // rewinddir
                 Some(f) => {
                     let pos = match c { 0 => Some(SeekFrom::Start(b)), 1 => Some(SeekFrom::Current(b as i64)), 2 => Some(SeekFrom::End(b as i64)), _ => None };
-                    pos.and_then(|p| f.seek(p).ok()).map(|p| p as i64).unwrap_or(-errno("EINVAL"))
+                    pos.and_then(|p| f.file.seek(p).ok()).map(|p| p as i64).unwrap_or(-errno("EINVAL"))
                 }
                 None => -errno("EBADF"),
             },
@@ -723,6 +840,7 @@ fn main() -> io::Result<()> {
     drop(out);
 
     print_notebook(&ram, exits);
-    println!("\nVMM: agent exited with code {code}. Total time {:.1} ms (create VM + load + run).", t0.elapsed().as_secs_f64() * 1e3);
+    let how = if code > 128 && code < 128 + 65 { format!(" (signal {}: the program ended itself, e.g. abort())", code - 128) } else { String::new() };
+    println!("\nVMM: agent exited with code {code}{how}. Total time {:.1} ms (create VM + load + run).", t0.elapsed().as_secs_f64() * 1e3);
     Ok(())
 }

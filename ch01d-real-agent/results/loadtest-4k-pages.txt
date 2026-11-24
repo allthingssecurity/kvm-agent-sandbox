@@ -1,23 +1,23 @@
-machine: 2 CPUs, 967 MB RAM, 833 MB available
+machine: 2 CPUs, 967 MB RAM, 834 MB available
 
 A. cold start (new process + VM + load ELF + supervisor + agent prints + exit), 100 runs, one at a time
-   p50 3.77 ms   p90 4.01 ms   p99 4.51 ms   max 5.15 ms
+   p50 4.24 ms   p90 4.57 ms   p99 5.26 ms   max 5.74 ms
 
 B. throughput: 256 sandboxes per row (each: start, print, exit)
    in flight   sandboxes/s   p50 ms   p99 ms   failures
-           1           209     4.13     4.87          0
-           2           305     5.55    10.27          0
-           4           345    10.41    18.32          0
-           8           364    19.49    32.51          0
-          16           380    31.39    51.54          0
-          32           385    51.75    94.17          0
+           1           186     4.70     5.68          0
+           2           268     6.53    10.81          0
+           4           311    12.10    19.96          0
+           8           321    22.16    34.53          0
+          16           338    35.76    62.69          0
+          32           323    57.93   102.97          0
 
 C. density: idle sandboxes (each agent sleeps 150 s); adding 10 at a time, stopping while 200 MB is still free
    alive   memory used   per sandbox   avg VMM RSS
-      50        128 MB       2.56 MB       3.48 MB
-     100        315 MB       3.15 MB       3.61 MB
-     150        496 MB       3.31 MB       3.23 MB
-     180        601 MB       3.34 MB       3.38 MB
-   reached 180 idle sandboxes in 6.2 s
-   CPU use with 180 idle sandboxes: 0.0% of the machine (measured over 3 s)
-   after killing them all: 787 MB available again (started with 797 MB)
+      50        109 MB       2.18 MB       3.30 MB
+     100        274 MB       2.74 MB       3.21 MB
+     150        434 MB       2.89 MB       3.05 MB
+     190        579 MB       3.05 MB       3.57 MB
+   reached 190 idle sandboxes in 6.6 s
+   CPU use with 190 idle sandboxes: 0.0% of the machine (measured over 3 s)
+   after killing them all: 825 MB available again (started with 769 MB)

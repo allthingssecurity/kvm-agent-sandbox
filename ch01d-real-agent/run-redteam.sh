@@ -35,9 +35,13 @@ echo; echo "################ 3. fuzzing: random system calls with hostile argume
 seeds=${FUZZ_SEEDS:-20}; calls=${FUZZ_CALLS:-5000}; bad=0
 for s in $(seq 1 $seeds); do
     out=$(timeout 30 $V --policy $P $R -- fuzz $s $calls 2>&1); code=$?
-    how=$(echo "$out" | grep -o "supervisor still answering\|STOPPED: .*\|Error: .*" | head -1)
+    how=$(echo "$out" | grep -o "exited with code [0-9]*\|STOPPED: .*\|Error: .*" | head -1)
     case "$how" in
-        "supervisor still answering"|"STOPPED: output limit"*|"STOPPED: write to address 0"*|"STOPPED: memory access"*) ;;
+        # 77: the fuzzer finished. A stop or crash of the fuzzer's own making is fine too: random calls
+        # (dup3 over its fds, writes into its own buffers) can break the fuzzer. Not fine: a supervisor
+        # crash, a VMM error, a hang.
+        "exited with code 77") how="finished all calls, supervisor still answering" ;;
+        "STOPPED: output limit"*|"STOPPED: write to address 0"*|"STOPPED: memory access"*|"STOPPED: illegal instruction"*|"STOPPED: the audit log is full"*|"exited with code 13"[0-9]) ;;
         *) bad=$((bad+1)); echo "FAIL seed $s (exit $code): $how" ;;
     esac
     echo "$how" | sed 's/: class.*//; s/ of .*//'

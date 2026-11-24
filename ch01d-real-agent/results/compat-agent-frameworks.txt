@@ -2,28 +2,24 @@ System calls made by the real tool code of two agent frameworks (traced with str
   deepagents  libs/deepagents/deepagents/backends/sandbox.py: the commands its file tools send to a sandbox
   Hermes Agent tools/code_execution_tool.py: the execute_code script (both transports) and a terminal() command
 
-deepagents_build_ls_cmd               34 distinct system calls,   1328 calls in total
-deepagents_build_read_cmd             34 distinct system calls,   1435 calls in total
-deepagents_build_glob_cmd             35 distinct system calls,   1600 calls in total
-deepagents_build_write_preflight_cmd    34 distinct system calls,   1154 calls in total
-deepagents_build_edit_inline_cmd      38 distinct system calls,   1421 calls in total
-hermes_execute_code_uds               35 distinct system calls,   1779 calls in total
-hermes_execute_code_file              39 distinct system calls,   2068 calls in total
-hermes_terminal                       36 distinct system calls,    237 calls in total
+deepagents_build_edit_inline_cmd        38 distinct system calls
+deepagents_build_glob_cmd               35 distinct system calls
+deepagents_build_ls_cmd                 34 distinct system calls
+deepagents_build_read_cmd               34 distinct system calls
+deepagents_build_write_preflight_cmd    34 distinct system calls
+hermes_execute_code_file                39 distinct system calls
+hermes_execute_code_uds                 35 distinct system calls
+hermes_terminal                         36 distinct system calls
 
-union of all: 54 distinct system calls
+supported by the supervisor: 69
+needed and supported (46): brk chdir clock_gettime close dup3 exit_group faccessat2 fcntl fstat getcwd getdents64 getegid geteuid getgid getpgid getpid getppid getrandom getresgid getresuid gettid getuid ioctl kill lseek mkdirat mmap mprotect munmap nanosleep newfstatat openat prlimit64 read readlinkat readv renameat rt_sigaction rt_sigprocmask set_tid_address setgid setsid setuid uname write writev 
 
-supported by the supervisor:       30
-needed and supported: brk clock_gettime close exit_group fstat getegid geteuid getgid getpid getrandom gettid getuid ioctl lseek mmap mprotect munmap nanosleep openat read rt_sigaction rt_sigprocmask set_tid_address write writev 
-
-needed but MISSING (29), with how many of the 8 workloads use each:
-8  setuid         8  setgid        8  newfstatat
-8  getdents64     8  fcntl         8  execve
-7  readlinkat     7  getppid       7  getcwd
-6  uname          6  dup3          3  wait4
-3  clone          2  rt_sigreturn  2  renameat
-2  readv          2  chdir         1  socket
-1  setsid         1  prlimit64     1  pipe2
-1  mkdirat        1  kill          1  getresuid
-1  getresgid      1  getpgid       1  faccessat2
-1  epoll_create1  1  connect
+needed but MISSING (8), with how many of the 8 workloads use each:
+ 8  execve
+ 3  wait4
+ 3  clone
+ 2  rt_sigreturn
+ 1  socket
+ 1  pipe2
+ 1  epoll_create1
+ 1  connect

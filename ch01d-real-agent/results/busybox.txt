@@ -1,0 +1,39 @@
+command (cwd = /workspace)                                     result      exits      time
+ls -la /workspace                                              ok             11     5.8 ms
+ls                                                             ok              9     5.1 ms
+find /workspace -name *.txt                                    ok              9     5.2 ms
+grep -rn agent /workspace                                      ok             14     6.0 ms
+cat /workspace/notes.txt                                       ok              6     4.4 ms
+head -c 20 /workspace/notes.txt                                ok              6     4.7 ms
+tail -n 1 /workspace/notes.txt                                 ok              8     4.5 ms
+wc -l /workspace/notes.txt                                     ok              7     4.8 ms
+sort /workspace/notes.txt                                      ok              8     4.7 ms
+awk {print $1} /workspace/notes.txt                            ok              8     5.1 ms
+sed s/agent/AGENT/ /workspace/notes.txt                        ok              8     5.1 ms
+md5sum /workspace/notes.txt                                    ok              7     4.6 ms
+sha256sum /workspace/notes.txt                                 ok              7     4.6 ms
+base64 /workspace/notes.txt                                    ok              8     4.5 ms
+od -c -N 8 /workspace/notes.txt                                ok              7     4.7 ms
+xxd -l 16 /workspace/notes.txt                                 ok              7     4.8 ms
+stat /workspace/notes.txt                                      ok              5     4.7 ms
+du -a /workspace                                               ok             10     5.1 ms
+diff /workspace/notes.txt /workspace/notes.txt                 ok              3     3.9 ms
+cmp /workspace/notes.txt /workspace/notes.txt                  ok              7     4.4 ms
+realpath /workspace/notes.txt                                  ok              5     4.0 ms
+mkdir -p /tmp/a/b/c                                            ok              1     4.0 ms
+cp /workspace/notes.txt /tmp/copy.txt                          ok              7     4.8 ms
+tar -cf /tmp/ws.tar /workspace                                 ok             11     6.5 ms
+sh -c echo hello > /tmp/f; echo world >> /tmp/f; while read l; do echo got: $l; done < /tmp/f ok              3     5.5 ms
+sh -c cd /workspace; for f in *; do echo file: $f; done; pwd   ok              9     5.9 ms
+sh -c x=0; while [ $x -lt 1000 ]; do x=$((x+1)); done; echo $x ok              2     5.7 ms
+uname -a                                                       ok              3     3.9 ms
+id                                                             ok              3     4.1 ms
+nproc                                                          ok              3     4.0 ms
+date                                                           ok              3     3.9 ms
+env                                                            ok              1     3.5 ms
+sh -c echo x > /workspace/new.txt                              exit 1          4     5.8 ms
+ls /                                                           exit 1          2     4.9 ms
+sh -c cat /workspace/notes.txt | wc -l                         exit 2          4     5.5 ms
+sh -c mkdir /tmp/x                                             exit 127        4     5.6 ms
+free                                                           exit 1          5     4.5 ms
+ps                                                             exit 1          4     4.8 ms
