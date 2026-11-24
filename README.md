@@ -18,12 +18,242 @@ doesn't know it's sandboxed. It can read a host folder (read-only) and write to 
 From the CPU's privilege levels and page tables, through how exploits happen and why containers share one kernel, to
 hardware virtualization, this sandbox's design, its tests and its performance.
 
-<!-- Inline player: in GitHub's web editor, drag video/build/kvm-agent-sandbox-explained-small.mp4 onto the next line. -->
+[![A virtual machine for every tool call: the explainer video](video/thumbnail.jpg)](https://allthingssecurity.github.io/kvm-agent-sandbox/)
 
-[![A virtual machine for every tool call: the explainer video](video/thumbnail.jpg)](https://github.com/allthingssecurity/kvm-agent-sandbox/releases/download/video-v1/kvm-agent-sandbox-explained.mp4)
-
-Full quality (1080p, 17.6 MB) and subtitles (`.srt`): [release `video-v1`](https://github.com/allthingssecurity/kvm-agent-sandbox/releases/tag/video-v1).
+**[▶ Play it in the browser](https://allthingssecurity.github.io/kvm-agent-sandbox/)** (with subtitles and chapters). Full quality (1080p) and the `.srt` file: [release `video-v1`](https://github.com/allthingssecurity/kvm-agent-sandbox/releases/tag/video-v1).
 The video is generated from [`video/`](video/) (`python make_video.py`, needs macOS `say`, ffmpeg and Pillow).
+
+## How it works
+
+### The big picture
+
+```mermaid
+flowchart TB
+    subgraph VM["KVM virtual machine: one per sandbox"]
+        direction TB
+        AGENT["<b>Agent program</b> (guest EL0)<br/>an unmodified static Linux binary"]
+        SUP["<b>Supervisor</b> (guest EL1)<br/>~1,200 lines of Rust: no kernel, no devices, no boot"]
+    end
+    subgraph HOST["Host: a Linux machine or a Linux VM"]
+        direction TB
+        KVM["<b>Linux + KVM</b> (EL1 and EL2)<br/>runs the VM and owns its stage-2 page tables"]
+        VMM["<b>VMM</b> (an ordinary process, EL0)<br/>jailed: seccomp, Landlock, namespaces"]
+        WS[("workspace folder<br/>read-only")]
+    end
+    AGENT -- "every system call (svc):<br/>stays inside the VM" --> SUP
+    SUP -- "only forwarded calls:<br/>a doorbell, one VM exit" --> KVM
+    KVM -- "the exit reaches" --> VMM
+    VMM -- "openat2(RESOLVE_BENEATH)" --> WS
+```
+
+- **The agent** is the untrusted code: an ordinary Linux program that doesn't know it's sandboxed.
+- **The supervisor** plays the part of the program's kernel. It answers, refuses or forwards each system call, and it
+  is the only code inside the VM with privileges.
+- **The VMM** is the only part on the host. It creates the VM, loads the program, carries out the few forwarded calls,
+  and is locked down itself.
+- **KVM and the CPU** keep the whole VM inside its own memory.
+
+### Who runs at which CPU level
+
+An arm64 CPU runs code at *exception levels*: EL0 for programs, EL1 for a kernel, EL2 for a hypervisor (x86 calls them
+ring 3, ring 0 and VMX root). Code at a lower level can't touch the memory, registers or instructions of a higher one;
+if it tries, the CPU stops it and hands control to the level above. A VM gets its own EL0 and EL1.
+
+| CPU level | On the host | Inside each sandbox VM |
+|---|---|---|
+| **EL2** (hypervisor) | KVM | — |
+| **EL1** (kernel) | Linux | **the supervisor** (instead of a guest kernel) |
+| **EL0** (programs) | the VMM, and the host's other programs | **the agent program** |
+
+So the agent is at the bottom of both stacks. Its system calls reach the supervisor, never the host's Linux directly.
+
+### Start-up, in three steps
+
+1. **The VMM** opens `/dev/kvm` and creates a VM with 256 MiB of address space; the host spends memory only on pages
+   that are touched. It loads the supervisor and the agent's ELF the way Linux's `execve` would: segments, then the
+   starting stack with argv and auxv. It writes the page tables and the **policy table**, then starts one vCPU at guest
+   EL1.
+2. **The supervisor** points the CPU's exception "door" (`VBAR_EL1`) at its own handlers, turns the MMU on, and drops
+   to guest EL0 at the agent's entry point.
+3. **From then on, every system call** (`svc`) of the agent jumps to the supervisor. That happens inside the VM, so it
+   isn't an exit.
+
+### One system call, step by step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent (guest EL0)
+    participant S as Supervisor (guest EL1)
+    participant V as VMM (host, jailed)
+    participant H as Host files
+    A->>S: svc: openat("/workspace/notes.txt")
+    Note over S: copy the path into its own memory,<br/>clean it up, check the policy
+    alt answer: memory, clock, /tmp, identity
+        S-->>A: the result, with no VM exit
+    else refuse: network, new programs, outside the policy
+        S-->>A: an error (EACCES, EPERM, ENOSYS), with no VM exit
+    else forward: read the workspace
+        S->>V: doorbell: one VM exit
+        Note over V: check again, with the same policy
+        V->>H: openat2(RESOLVE_BENEATH)
+        H-->>V: the file
+        V-->>S: the result, in the doorbell page
+        S-->>A: fd 3
+    end
+```
+
+| Bucket | Examples | VM exits |
+|---|---|---|
+| **Answer it** | Memory (`brk`, `mmap`), signal setup, `clock_gettime`, identity (`getpid`, `uname`, `getuid`), limits; the **fd table** (`dup3`, `fcntl`, `close`), the **current folder** (`getcwd`, relative paths), and **every file operation in `/tmp`**: `openat`, `read`, `write`, `mkdirat`, `renameat`, `unlinkat`, `getdents64`, `newfstatat` | **0** |
+| **Refuse it** | Paths outside the policy, writes outside `/tmp`, `socket`, `clone`/`execve`, anything unknown | **0** |
+| **Forward it** | `write` to stdout, reading `/workspace` (`openat`, `read`, `newfstatat`, `getdents64`, `readlinkat`, `chdir`), `getrandom`, `nanosleep` | 1 each |
+
+About 70 Linux system calls in all. The supervisor keeps the state a kernel keeps for a process: a table of 64 file
+descriptors (with offsets shared after `dup`, as on Linux), the current folder, and `/tmp`'s file table. Paths are
+cleaned up by text before any check (`""`, `.` and `..` are resolved), so what the prefix check sees is exactly what
+gets opened.
+
+Forwarding works like this. The supervisor checks the call, copies paths into its own memory, writes a request to a
+shared page and "rings the doorbell": a store to an address with no memory behind it. KVM hands that exit to the VMM,
+which performs the real host system call and writes back the result.
+
+A fault (touching forbidden memory, a privileged instruction) stops the agent. Every decision goes into an audit log in
+supervisor memory, which the VMM reads and prints after the run.
+
+### How memory is protected: two checks on every access
+
+```mermaid
+flowchart LR
+    ADDR["an address the<br/>agent uses"] --> S1{"<b>stage 1</b><br/>the supervisor's<br/>page tables"}
+    S1 -- "may EL0 use it?<br/>write it? run it?<br/>no" --> F1["fault: the agent<br/>is stopped"]
+    S1 -- "yes" --> GPA["guest physical<br/>address"]
+    GPA --> S2{"<b>stage 2</b><br/>KVM's page tables"}
+    S2 -- "not this VM's<br/>memory" --> F2["fault to KVM: other VMs<br/>and the host don't exist here"]
+    S2 -- "this VM's RAM" --> RAM["real memory"]
+```
+
+The MMU makes both checks in hardware on every memory access, with no software involved. The supervisor writes stage 1;
+KVM writes stage 2, and the guest can't change it. Inside the VM, the memory is split like this:
+
+| Guest memory | Agent (EL0) | Supervisor (EL1) |
+|---|---|---|
+| Supervisor code | no access | read and run |
+| Supervisor constants; the policy; the boot record; the page tables | no access | **read only** |
+| Supervisor data: audit log, path copies, fd table, its stack | no access | read and write, **never run** |
+| `/tmp` file data (up to `tmp_kb`) | no access | read and write, never run |
+| Agent code | read and run | read |
+| Agent data, heap, `mmap` area (up to `memory_mb`), stack | read and write, **never run** | read and write |
+| Everything else: the gaps between regions, memory past `memory_mb` | **unmapped: fault** | **unmapped: fault** |
+
+On top of that, the CPU's `WXN` bit makes any writable page non-executable, whatever its entry says. When the agent
+hands the supervisor a pointer, the supervisor asks the MMU (`AT S1E0R` / `AT S1E0W`) whether the agent itself could
+read or write that memory. So the supervisor never touches anything on the agent's behalf that the agent couldn't touch.
+
+### Walls, from inside out
+
+```mermaid
+flowchart TB
+    subgraph W4["Wall 4: the host jail around the VMM (seccomp, Landlock, namespaces)"]
+        direction TB
+        subgraph W3["Wall 3: the VMM checks every forwarded request again"]
+            direction TB
+            subgraph W2["Wall 2: the CPU and KVM (privilege levels, stage-2 page tables)"]
+                direction TB
+                subgraph W1["Wall 1: the supervisor's policy"]
+                    AG["agent code"]
+                end
+            end
+        end
+    end
+```
+
+1. **The supervisor's policy**, inside the VM: allow or deny per system call, with an errno; path prefixes checked on
+   the supervisor's own copy of the path; memory limits; and every pointer checked by the MMU (see above).
+2. **The CPU and KVM**: the agent at guest EL0 can't touch supervisor pages or change the door register. Memory past
+   `memory_mb` isn't mapped at all, and `/tmp`'s data sits in pages only the supervisor (EL1) can touch, capped by
+   `tmp_kb`. Stage-2 page tables confine the whole VM to its own RAM.
+3. **The VMM's checks and limits**:
+   - It re-checks every forwarded request with the same policy.
+   - It opens workspace files only through `openat2(RESOLVE_BENEATH)`, starting from a handle on the workspace folder.
+     The kernel refuses any path, symlink or `..` that would leave it, in the same step as the open.
+   - It writes results only into the agent's own memory areas.
+   - It enforces a wall-clock watchdog (by interrupting `KVM_RUN`), an output cap and an open-files cap.
+   - A full audit log stops the agent instead of losing entries.
+4. **The host jail on the VMM process**:
+   - **seccomp**: 35 host system calls. `ioctl` only for `KVM_RUN`, `write` only to stdout and stderr, no `PROT_EXEC`
+     in `mmap`/`mprotect` (no new executable memory for injected code), no write flags on `openat`.
+   - **Landlock**: the VMM can open files only beneath the workspace, read-only. No TCP. Signals and abstract Unix
+     sockets only within its own sandbox.
+   - **rlimits and more**: no new processes, no core dumps, not dumpable (other processes of the same user can't read
+     its memory or `/proc` files), and its own user, IPC and UTS namespaces.
+   - The self-test (`--jail-selftest`) proves it: `open("/etc/passwd")` is refused, and `socket()` kills the VMM with
+     SIGSYS.
+
+### Policy as data
+
+```ini
+time_limit_ms   = 3000
+memory_mb       = 32
+tmp_kb          = 4096       # /tmp, in VM memory; 0 = no /tmp
+max_output_kb   = 64
+max_open_files  = 8
+workspace       = ./workspace
+read            = /workspace/
+
+allow = brk mmap munmap mprotect madvise set_tid_address rt_sigaction rt_sigprocmask sigaltstack
+allow = write writev read readv openat close fstat newfstatat lseek getdents64 readlinkat getcwd chdir
+allow = dup dup3 fcntl mkdirat unlinkat renameat ftruncate getrandom nanosleep clock_nanosleep
+deny socket socketpair bind connect = EACCES     # no network
+deny clone clone3 execve            = EPERM      # no new processes
+```
+
+Anything not mentioned is refused, and unknown keys or system-call names are errors. The same supervisor binary obeys
+whatever policy it's given: see [`policies/`](ch01d-real-agent/policies/).
+
+## Why this is safer than a container
+
+A container is a set of Linux features around a normal process. **Namespaces** change what it can see, **cgroups** limit
+how much it can use, and **seccomp** filters which system calls it may make. But every container on a machine talks to
+**the same kernel**, through the same roughly 350 system calls. So one exploitable kernel bug that's reachable from
+inside is enough to control the kernel, and with it every container and the host. Real examples:
+- Dirty Pipe ([CVE-2022-0847](https://nvd.nist.gov/vuln/detail/CVE-2022-0847)): unprivileged code could overwrite
+  read-only files.
+- The netfilter bug [CVE-2024-1086](https://nvd.nist.gov/vuln/detail/CVE-2024-1086): a normal user could become root,
+  and it has been exploited in real attacks.
+- runc's "Leaky Vessels" ([CVE-2024-21626](https://nvd.nist.gov/vuln/detail/CVE-2024-21626)): a container could
+  reach the host's files.
+
+Here's what one bug buys an attacker in each design:
+
+```mermaid
+flowchart TB
+    A["untrusted agent code"]
+    A -- "in a container<br/>bug 1: in the shared kernel" --> CK["the kernel, as root"]
+    CK --> CH["the whole machine:<br/>the host and every container"]
+    A -- "in this sandbox<br/>bug 1: in the supervisor" --> KS["guest EL1 of VM A only:<br/>'root' here means nothing outside"]
+    KS -. "can't reach: separate<br/>stage-2 tables" .-> KB["VM B: untouched"]
+    KS -- "bug 2: in KVM or the VMM" --> KV["the VMM process"]
+    KV -- "bug 3: out of the VMM's jail" --> KH["the host"]
+    classDef bad fill:#fde2e2,stroke:#dc2626,color:#7f1d1d
+    classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef good fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class CK,CH bad
+    class KS warn
+    class KB good
+```
+
+| An attacker who found... | a shared-kernel bug (container) | a supervisor bug (this sandbox) |
+|---|---|---|
+| Privileged inside its own box | yes | yes |
+| Root on the host machine | potentially yes | no: needs bug 2, then bug 3 |
+| Other tenants' sandboxes | potentially yes | no: separate stage-2 tables, enforced by the CPU |
+| Host files and network | potentially yes | only through checked, forwarded requests |
+
+A compromised supervisor can make the program *believe* it's root, but the host has no Linux process for the agent to
+promote. It only sees the VMM, an ordinary jailed process. Firecracker-style microVMs share this property. The
+difference here is that there's no guest kernel to boot, so a fresh VM per tool call costs milliseconds.
+
 
 ## Measured numbers
 
@@ -83,6 +313,20 @@ tables: the sandbox's, the Linux VM's and macOS's. With 4 KiB pages there are ma
 nothing on its own. **2 MiB pages for just the program's code and the supervisor** cut a warm call from 7.1 to 2.3 ms
 (and a cold one from 6.7 to 4.5 ms), for about 2 MB more host memory per sandbox.
 
+```mermaid
+sequenceDiagram
+    participant C as a tool call
+    participant P as pool
+    participant W as warm sandbox (vmm --warm)
+    P->>W: start it ahead of time
+    Note over W: VM created, program loaded,<br/>pages mapped, jail on: waiting
+    C->>P: grep -rn agent /workspace
+    P->>W: the arguments
+    Note over W: build the stack, start the clock, run
+    W-->>C: output and exit code, about 2 ms
+    P->>P: build a replacement, after the call
+```
+
 The warm pool then moves everything else off the call's path:
 - `vmm --warm` does all the set-up, including the jail. The supervisor maps the pages the program will need (pre-mapping
   is worth it once code uses 2 MiB pages: 5.7 → 2.5 ms). Then it rings a "ready" doorbell, and the VMM waits on stdin.
@@ -97,82 +341,6 @@ Honest limits of these numbers:
 - **After about a second of idling** everything here gets slower: a plain process goes from 1 ms to 5–6 ms, and a warm VM
   to 9–10 ms. The Mac lets the Lima VM's CPUs sleep, and waking them, plus the nested state, costs that. On a busy
   server or bare metal this should mostly vanish, but it is not measured yet.
-
-## How it works
-
-```
-                    REAL mode (the host)                     GUEST mode (inside the VM)
- level 0 (kernel)   host Linux + KVM                         SUPERVISOR  (Rust, no_std, ~1,200 lines)
- level 3 (user)     VMM  (Rust, ~850 lines, jailed)          AGENT       (unmodified static Linux ELF)
-```
-
-1. **The VMM** opens `/dev/kvm`, creates a VM with 256 MiB of lazily allocated RAM (a page costs host memory only once it is touched), and loads the supervisor. It loads
-   the agent's ELF the way Linux's `execve` would (segments, then the starting stack with argv and auxv), writes page tables
-   ("supervisor memory: level 0 only"), writes the **policy table**, and starts one vCPU at guest level 0.
-2. **The supervisor** points the CPU's exception "door" (`VBAR_EL1`) at its own handlers, turns the MMU on, and drops to
-   guest level 3 at the agent's entry point.
-3. **Every system call** (`svc`) of the agent jumps to the supervisor. This happens inside the VM; it isn't an exit.
-
-| Bucket | Examples | VM exits |
-|---|---|---|
-| **Answer it** | Memory (`brk`, `mmap`), signal setup, `clock_gettime`, identity (`getpid`, `uname`, `getuid`), limits; the **fd table** (`dup3`, `fcntl`, `close`), the **current folder** (`getcwd`, relative paths), and **every file operation in `/tmp`**: `openat`, `read`, `write`, `mkdirat`, `renameat`, `unlinkat`, `getdents64`, `newfstatat` | **0** |
-| **Refuse it** | Paths outside the policy, writes outside `/tmp`, `socket`, `clone`/`execve`, anything unknown | **0** |
-| **Forward it** | `write` to stdout, reading `/workspace` (`openat`, `read`, `newfstatat`, `getdents64`, `readlinkat`, `chdir`), `getrandom`, `nanosleep` | 1 each |
-
-About 70 Linux system calls in all. The supervisor keeps the state a kernel keeps for a process: a table of 64 file
-descriptors (shared offsets after `dup`, like Linux), the current folder, and `/tmp`'s file table. Paths are cleaned up
-by text before any check (`""`, `.` and `..` are resolved), so what the prefix check sees is exactly what gets opened.
-
-Forwarding means the supervisor checks the call, copies paths into its own memory, writes a request to a shared page and
-"rings the doorbell": a store to an address with no memory behind it. KVM hands that exit to the VMM, which performs the
-real host system call and writes back the result.
-
-A fault (touching forbidden memory, a privileged instruction) stops the agent. Every decision goes into an audit log in
-supervisor memory, which the VMM reads and prints after the run.
-
-### Walls, from inside out
-
-1. **Supervisor policy**, inside the VM: per-system-call allow/deny with errno, path prefixes checked on the supervisor's
-   own copy, and memory limits. Every pointer the agent passes is checked by asking the MMU (`AT S1E0R`/`AT S1E0W`)
-   whether the agent itself could read or write it. The supervisor never touches memory on the agent's behalf that the
-   agent couldn't touch.
-2. **CPU and KVM**: the agent at guest level 3 can't touch supervisor pages or change the door register. Memory beyond
-   `memory_mb` isn't mapped at all. `/tmp`'s data sits in pages mapped for level 0 only, capped by `tmp_kb`. Stage-2
-   page tables confine the whole VM to its own RAM.
-3. **VMM checks and limits**: it re-checks every forwarded request with the same policy and opens workspace files only
-   through `openat2(RESOLVE_BENEATH)` from a handle on the workspace folder: the kernel refuses any path, symlink or
-   `..` that would leave it, in the same step as the open. It writes results only into the agent's own memory areas. It enforces a wall-clock watchdog (it
-   interrupts `KVM_RUN`), an output cap and an open-files cap. A full audit log stops the agent instead of losing
-   entries.
-4. **Host jail on the VMM process**:
-   - **seccomp**: 35 host system calls; `ioctl` only for `KVM_RUN`, `write` only to stdout and stderr, no `PROT_EXEC`
-     in `mmap`/`mprotect` (no new executable memory for injected code), no write flags on `openat`.
-   - **Landlock**: the VMM can open files only beneath the workspace, read-only; no TCP; signals and abstract Unix
-     sockets only within its own sandbox.
-   - **rlimits and more**: no new processes, no core dumps, not dumpable (other processes of the same user can't read
-     its memory or `/proc` files), its own user, IPC and UTS namespaces.
-   - The self-test (`--jail-selftest`) proves it: `open("/etc/passwd")` is refused, and `socket()` kills the VMM with SIGSYS.
-
-### Policy as data
-
-```ini
-time_limit_ms   = 3000
-memory_mb       = 32
-tmp_kb          = 4096       # /tmp, in VM memory; 0 = no /tmp
-max_output_kb   = 64
-max_open_files  = 8
-workspace       = ./workspace
-read            = /workspace/
-
-allow = brk mmap munmap mprotect madvise set_tid_address rt_sigaction rt_sigprocmask sigaltstack
-allow = write writev read readv openat close fstat newfstatat lseek getdents64 readlinkat getcwd chdir
-allow = dup dup3 fcntl mkdirat unlinkat renameat ftruncate getrandom nanosleep clock_nanosleep
-deny socket socketpair bind connect = EACCES     # no network
-deny clone clone3 execve            = EPERM      # no new processes
-```
-
-Anything not mentioned is refused, and unknown keys or system-call names are errors. The same supervisor binary obeys
-whatever policy it's given: see [`policies/`](ch01d-real-agent/policies/).
 
 ## Can it run any code? Tested with Hermes Agent and deepagents
 
@@ -397,7 +565,7 @@ The chapters build up to the sandbox:
 | Folder | What it shows |
 |---|---|
 | [`ch01-hello-kvm`](ch01-hello-kvm/) | The smallest KVM VM: raw ioctls, 10 hand-written instructions, every printed character is a VM exit |
-| [`ch01b-supervisor`](ch01b-supervisor/) | A supervisor at guest level 0 and untrusted code at level 3; the CPU blocks attacks |
+| [`ch01b-supervisor`](ch01b-supervisor/) | A supervisor at guest EL1 and untrusted code at EL0; the CPU blocks attacks |
 | [`ch01c-syscall-buckets`](ch01c-syscall-buckets/) | Answer, refuse or forward each system call (in assembly) |
 | [`ch01d-real-agent`](ch01d-real-agent/) | **The sandbox**: Rust supervisor, a real ELF agent, policy files, limits, watchdog, jailed VMM, load test |
 
