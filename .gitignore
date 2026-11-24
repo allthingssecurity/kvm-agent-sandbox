@@ -13,3 +13,5 @@ ch01d-real-agent/compat/h_code_execution_tool.py
 ch01d-real-agent/compat/da_cmds.json
 ch01d-real-agent/compat/hermes_tools_*.py
 ch01d-real-agent/redteam/workspace/
+video/build/
+__pycache__/

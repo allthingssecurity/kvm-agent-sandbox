@@ -4,7 +4,9 @@ set -e
 cd "$(dirname "$0")"
 BIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
 (cd supervisor && cargo build --release -q 2>/dev/null || cargo build --release)
-"$BIN/rust-objcopy" -O binary supervisor/target/aarch64-unknown-none-softfloat/release/supervisor supervisor.bin
+# supervisor.bin is only to show the size; the VMM embeds the supervisor's ELF file.
+[ -x "$BIN/rust-objcopy" ] && "$BIN/rust-objcopy" -O binary supervisor/target/aarch64-unknown-none-softfloat/release/supervisor supervisor.bin
 (cd agent && cargo build --release -q)
 (cd vmm && cargo build --release -q)
-echo "built: supervisor.bin ($(wc -c < supervisor.bin) bytes), agent, vmm"
+(cd redteam && cargo build --release -q)
+echo "built: supervisor ($( [ -f supervisor.bin ] && echo "$(wc -c < supervisor.bin) bytes" || echo ELF )), agent, redteam, vmm (+ loadtest, pool)"

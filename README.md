@@ -13,6 +13,18 @@ doesn't know it's sandboxed. It can read a host folder (read-only) and write to 
 > Status: a working research prototype from a book on writing a VMM from scratch. It is **not** audited and not ready
 > for hostile production traffic. The limitations are listed below.
 
+## Watch: how it works (8.6 minutes)
+
+From the CPU's privilege levels and page tables, through how exploits happen and why containers share one kernel, to
+hardware virtualization, this sandbox's design, its tests and its performance.
+
+<!-- Inline player: in GitHub's web editor, drag video/build/kvm-agent-sandbox-explained-small.mp4 onto the next line. -->
+
+[![A virtual machine for every tool call: the explainer video](video/thumbnail.jpg)](https://github.com/allthingssecurity/kvm-agent-sandbox/releases/download/video-v1/kvm-agent-sandbox-explained.mp4)
+
+Full quality (1080p, 17.6 MB) and subtitles (`.srt`): [release `video-v1`](https://github.com/allthingssecurity/kvm-agent-sandbox/releases/tag/video-v1).
+The video is generated from [`video/`](video/) (`python make_video.py`, needs macOS `say`, ffmpeg and Pillow).
+
 ## Measured numbers
 
 From a MacBook (Apple M4 Pro), inside a Lima VM running Alpine Linux 6.18 with **2 vCPUs and 1 GiB RAM**, using **nested
@@ -127,14 +139,18 @@ supervisor memory, which the VMM reads and prints after the run.
 2. **CPU and KVM**: the agent at guest level 3 can't touch supervisor pages or change the door register. Memory beyond
    `memory_mb` isn't mapped at all. `/tmp`'s data sits in pages mapped for level 0 only, capped by `tmp_kb`. Stage-2
    page tables confine the whole VM to its own RAM.
-3. **VMM checks and limits**: it re-checks every forwarded request with the same policy, resolves symlinks and checks
-   the result, and writes results only into the agent's own memory areas. It enforces a wall-clock watchdog (it
+3. **VMM checks and limits**: it re-checks every forwarded request with the same policy and opens workspace files only
+   through `openat2(RESOLVE_BENEATH)` from a handle on the workspace folder: the kernel refuses any path, symlink or
+   `..` that would leave it, in the same step as the open. It writes results only into the agent's own memory areas. It enforces a wall-clock watchdog (it
    interrupts `KVM_RUN`), an output cap and an open-files cap. A full audit log stops the agent instead of losing
    entries.
 4. **Host jail on the VMM process**:
-   - **seccomp**: 34 host system calls; `ioctl` only for `KVM_RUN`, `write` only to stdout and stderr.
-   - **Landlock**: the VMM can open files only beneath the workspace, read-only.
-   - **rlimits**: no new processes, no core dumps.
+   - **seccomp**: 35 host system calls; `ioctl` only for `KVM_RUN`, `write` only to stdout and stderr, no `PROT_EXEC`
+     in `mmap`/`mprotect` (no new executable memory for injected code), no write flags on `openat`.
+   - **Landlock**: the VMM can open files only beneath the workspace, read-only; no TCP; signals and abstract Unix
+     sockets only within its own sandbox.
+   - **rlimits and more**: no new processes, no core dumps, not dumpable (other processes of the same user can't read
+     its memory or `/proc` files), its own user, IPC and UTS namespaces.
    - The self-test (`--jail-selftest`) proves it: `open("/etc/passwd")` is refused, and `socket()` kills the VMM with SIGSYS.
 
 ### Policy as data
@@ -248,6 +264,21 @@ security bug was found. One expectation changed: `/workspace//etc/passwd` now re
 so the path is `/workspace/etc/passwd`. In round 1 it reached the host's `/etc/passwd` path through a quirk of Rust's
 `Path::join`, and only the VMM's canonicalize check stopped it.
 
+**Round 3: hardening without a performance cost** ([`results/hardening-ab.txt`](ch01d-real-agent/results/hardening-ab.txt)):
+
+| Change | What it stops | Proof |
+|---|---|---|
+| **The supervisor is mapped W^X.** Code is read-only and executable, constants read-only, data never executable; the policy, boot record and page tables are read-only even for the supervisor; only the regions it uses are mapped, with gaps as guard pages; `SCTLR_EL1.WXN` on. Before, its whole 16 MiB area was read-write-execute. | A bug in the supervisor can't be turned into rewriting its code, its policy or its page tables | `vmm --supervisor-selftest 1..8`: patching its code, editing the policy, page tables or boot record, running code from data, writing below its stack, reading a gap, writing a constant all fault |
+| **Overflow checks on** in the supervisor | A silent arithmetic wrap-around becomes a clean stop | 300,000+ fuzzed calls: none triggered |
+| **seccomp argument filters, Landlock scopes, non-dumpable, namespaces** for the VMM | A compromised VMM gets no executable memory, can't open for writing, can't signal or connect to other sandboxes, and other processes can't read its memory | `vmm --jail-test NAME` for 8 attempts: 6 killed by seccomp, 2 refused by Landlock |
+| **`openat2(RESOLVE_BENEATH)`** for every workspace access (it replaced "canonicalize, check, then open by name") | No window between check and open, without relying on Landlock | [`race-test.sh`](ch01d-real-agent/race-test.sh): a host process swaps a folder for a symlink to `/etc` while the agent opens through it; 30,000 opens, **0 leaks** |
+| **KVM firmware services hidden** (random-number and paravirtual-time services, vendor calls) | Less hypervisor code reachable from a compromised supervisor | The VMM prints "hidden: 3 of 3" |
+
+The cost, measured by running the old and new builds alternately: **none measurable** (3.70–3.76 ms against 3.69–3.80 ms
+per cold run, 2.47/2.94 against 2.42/2.79 ms per warm call). One idea was dropped: a new *network* namespace per sandbox
+costs about 35% throughput, because Linux tears them down in a single worker. The network is already closed by seccomp
+and Landlock, so it stays opt-in (`VMM_NAMESPACES=net`).
+
 **What this testing does not show:**
 - **Not covered:** side channels (timing, cache), the host kernel's KVM code, and nested-virtualization behavior.
 - **Fuzzing depth:** the fuzzing is random, not coverage-guided.
@@ -295,32 +326,69 @@ practical platform could use both: this sandbox for the fast path, and a microVM
 - arm64 (aarch64) only. x86_64 needs a port (VMX, different page tables and system-call numbers).
 - Not audited, and fuzzed only randomly (see above). The supervisor's system-call layer is the attack surface.
 
-## Try it
+## Run it on your own Linux machine or VM
 
-You need Linux with `/dev/kvm` on arm64. On an Apple-silicon Mac (M3 or newer), a small Lima VM works, using about
-0.4 GB of disk:
+**What it needs:** an **arm64 (aarch64)** Linux machine or VM where **`/dev/kvm`** works, and a kernel **≥ 5.6**. A
+Linux *VM* therefore needs nested virtualization from its host. That is the case here: a Lima VM on a Mac runs KVM inside
+it. Landlock (kernel 5.13+, scopes 6.12+), user namespaces and huge pages are optional; the sandbox says at start-up which
+walls it has.
+
+| Where | Works? |
+|---|---|
+| Apple Silicon Mac, **M3 or newer**, with Lima (or another VM with nested virtualization) | **yes**: all numbers here were measured this way |
+| arm64 bare metal: AWS Graviton `*.metal`, Ampere servers, Raspberry Pi 5 with a 64-bit OS | expected to (KVM is there); not measured yet |
+| An ordinary arm64 cloud VM | only if the provider exposes nested virtualization; most don't. Run `check-host.sh` |
+| **Any x86_64 machine or VM** | **no**: the supervisor is arm64 code; an x86 port is future work |
+
+**Check a machine first** (no root needed). It lists every requirement and what to do about a missing one:
+
+```sh
+git clone https://github.com/allthingssecurity/kvm-agent-sandbox && cd kvm-agent-sandbox/ch01d-real-agent
+./check-host.sh
+```
+
+**Build and test on the Linux machine itself:**
+
+```sh
+# Rust, and the two targets: Linux programs (musl, static) and the supervisor (bare metal)
+curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y && . ~/.cargo/env
+rustup target add aarch64-unknown-linux-musl aarch64-unknown-none-softfloat
+sudo usermod -aG kvm $USER                      # then log in again, if /dev/kvm needs it
+sudo apt install busybox-static bubblewrap      # Debian/Ubuntu   (Alpine: apk add busybox-static bubblewrap)
+
+./build.sh                                      # supervisor, agent, red-team agent, VMM, load test, pool
+V=./vmm/target/aarch64-unknown-linux-musl/release/vmm
+$V                                              # the demo agent, with the notebook of every system call
+$V --policy policies/strict.policy              # same agent, stricter policy
+./run-tests.sh                                  # watchdog, memory limit, output limit, jail self-test
+./run-redteam.sh                                # 138 attacks, 21 must-stop attacks, fuzzing
+./race-test.sh                                  # symlink-swap race against workspace access
+./compat/run-busybox.sh                         # 38 real busybox commands
+for n in 1 2 3 4 5 6 7 8; do $V --supervisor-selftest $n compat/bin/busybox -- true 2>&1 | tail -1; done
+for t in read-etc-passwd open-workspace-for-writing executable-memory make-memory-executable network \
+         signal-another-process start-a-program new-process; do $V --jail-test $t; echo "  exit $?"; done
+./vmm/target/aarch64-unknown-linux-musl/release/loadtest                         # cold start, throughput, density
+./vmm/target/aarch64-unknown-linux-musl/release/pool compat/bin/busybox -- grep -rn agent /workspace
+VMM_TIMINGS=1 $V compat/bin/busybox -- true     # where the time of one run goes
+```
+
+**Or on a Mac (M3 or newer) with Lima**, building on the Mac and running inside a small Linux VM (about 0.4 GB of disk):
 
 ```sh
 limactl create --name=vmm --vm-type=vz --cpus=2 --memory=1 --disk=2 \
   --set '.nestedVirtualization=true' --mount-only "$PWD:w" --tty=false template:alpine
-limactl start vmm && limactl prune
+limactl start vmm
+limactl shell vmm sudo apk add busybox-static bubblewrap python3
 rustup target add aarch64-unknown-linux-musl aarch64-unknown-none-softfloat
-
-cd ch01d-real-agent
-./build.sh                                   # supervisor.bin, the agent ELF, the VMM (cross-built on the Mac)
-limactl shell vmm ./vmm/target/aarch64-unknown-linux-musl/release/vmm                   # run the agent
-limactl shell vmm ./vmm/target/aarch64-unknown-linux-musl/release/vmm --policy policies/strict.policy
-limactl shell vmm ./run-tests.sh             # watchdog, memory, output, jail self-test
-(cd redteam && cargo build --release)       # the hostile agent
-limactl shell vmm ./run-redteam.sh           # 138 attacks, 21 must-stop attacks, 20 fuzz runs (FUZZ_SEEDS=100 for more)
-limactl shell vmm sh -c 'sudo apk add busybox-static && ./compat/run-busybox.sh'   # real tools
-limactl shell vmm ./vmm/target/aarch64-unknown-linux-musl/release/loadtest              # the numbers above
-limactl shell vmm ./vmm/target/aarch64-unknown-linux-musl/release/pool compat/bin/busybox -- grep -rn agent /workspace
-limactl shell vmm sh -c 'VMM_TIMINGS=1 ./vmm/target/aarch64-unknown-linux-musl/release/vmm compat/bin/busybox -- true'   # where the time goes
+cd ch01d-real-agent && ./build.sh
+limactl shell --workdir "$PWD" vmm ./check-host.sh
+limactl shell --workdir "$PWD" vmm ./run-redteam.sh       # ...and any command from the list above
 ```
 
-Run your own program: build it as a static arm64 Linux binary linked at `0x81000000` (see
-`agent/.cargo/config.toml`), then run `vmm path/to/program -- args`.
+**Run your own program:** any static arm64 Linux binary (fixed-address, or a static PIE as most distributions build them):
+`vmm path/to/program -- args`. It must stay within the ~70 system calls the supervisor implements (see
+[Can it run any code?](#can-it-run-any-code-tested-with-hermes-agent-and-deepagents)); the notebook printed after the run
+shows what it asked for and what was refused.
 
 ## Repository layout
 

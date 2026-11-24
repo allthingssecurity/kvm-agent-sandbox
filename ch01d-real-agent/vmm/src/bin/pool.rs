@@ -113,7 +113,8 @@ fn main() {
 
     println!("  {:<44} {:>15}   {:>11}", "", "median / p99", "throughput");
     measure("plain process (no isolation)", &mut || call_process(&native), Duration::ZERO);
-    measure("fresh namespace sandbox (bwrap)", &mut || call_process(&bwrap), Duration::ZERO);
+    let have_bwrap = Command::new("bwrap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+    if have_bwrap { measure("fresh namespace sandbox (bwrap)", &mut || call_process(&bwrap), Duration::ZERO); }
     measure("cold VM (vmm: all set-up at call time)", &mut || call_process(&cold), Duration::ZERO);
 
     let (pool, refill) = start_pool(size, 2, &program);
@@ -124,7 +125,9 @@ fn main() {
 
     // The pool must not change what the program sees: compare with bwrap, which mounts the same workspace.
     let (warm_out, _) = warm_call();
-    let (bwrap_out, _) = call_process(&bwrap);
-    println!("\n  warm output identical to the bwrap run (same workspace): {}", if warm_out == bwrap_out { "yes" } else { "NO" });
+    let (cold_out, _) = call_process(&cold);
+    let cold_text = String::from_utf8_lossy(&cold_out).split("\n\n").nth(1).unwrap_or("").trim_end().to_string(); // between the VMM's banner and its report
+    let same = !warm_out.is_empty() && String::from_utf8_lossy(&warm_out).trim_end() == cold_text;
+    println!("\n  warm output identical to a cold VM run: {}", if same { "yes" } else { "NO" });
     std::process::exit(0); // the makers are still holding warm sandboxes; they die with us
 }

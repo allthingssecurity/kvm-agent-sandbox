@@ -1,0 +1,27 @@
+Hardening round: same machine, builds run alternately (before = commit a7baa0b, hardened = this commit).
+
+1. Load test (cold start, 32 in flight) and warm pool (grep -rn, calls 20 ms apart), two rounds:
+before    round 1 | cold:  p50 3.08 ms p90 3.50 ms p99 4.05 ms max 4.20 ms  32 519 37.08 67.47 0 
+before    round 1 |  warm VM, pool of 4, calls 20 ms apart 2.47 / 3.18 321 calls/s
+hardened  round 1 | cold:  p50 3.58 ms p90 3.89 ms p99 4.18 ms max 4.40 ms  32 486 37.57 64.20 0 
+hardened  round 1 |  warm VM, pool of 4, calls 20 ms apart 2.42 / 4.88 316 calls/s
+before    round 2 | cold:  p50 3.12 ms p90 3.30 ms p99 3.67 ms max 4.23 ms  32 489 35.76 64.81 0 
+before    round 2 |  warm VM, pool of 4, calls 20 ms apart 2.94 / 4.16 279 calls/s
+hardened  round 2 | cold:  p50 3.84 ms p90 4.34 ms p99 5.16 ms max 6.27 ms  32 447 42.87 77.49 0 
+hardened  round 2 |  warm VM, pool of 4, calls 20 ms apart 2.79 / 5.69 286 calls/s
+
+2. The cold-start gap above, measured directly: 80 runs of `vmm busybox -- true` per row, wall clock vs time inside main():
+.bench-old/ch01d-real-agent    ns=default  wall 3.763 ms, main 2.609 ms, outside main 1.155 ms
+ch01d-real-agent               ns=default  wall 3.796 ms, main 2.617 ms, outside main 1.180 ms
+ch01d-real-agent               ns=none     wall 3.689 ms, main 2.565 ms, outside main 1.124 ms
+.bench-old/ch01d-real-agent    ns=default  wall 3.699 ms, main 2.544 ms, outside main 1.155 ms
+ch01d-real-agent               ns=default  wall 3.729 ms, main 2.591 ms, outside main 1.138 ms
+ch01d-real-agent               ns=none     wall 3.741 ms, main 2.595 ms, outside main 1.146 ms
+=> no measurable difference; the load test's 0.5 ms gap was run-to-run noise.
+
+3. Network namespace (VMM_NAMESPACES=net) vs without, load test cold start and throughput at 8/32 in flight:
+net:   p50 4.02 ms, 316/s, 296/s   (second run: p50 3.92 ms, 301/s, 331/s)
+nonet: p50 3.47 ms, 445/s, 475/s
+none:  p50 3.57 ms, 489/s, 503/s
+=> a new network namespace per sandbox costs ~35% throughput (Linux tears them down in one worker).
+   Default is user + IPC + UTS namespaces only; the network is closed by seccomp and Landlock.

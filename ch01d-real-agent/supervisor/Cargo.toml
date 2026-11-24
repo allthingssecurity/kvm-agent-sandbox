@@ -7,6 +7,7 @@ description = "Guest level 0 (EL1): answers, refuses or forwards every system ca
 [profile.release]
 panic = "abort"
 opt-level = "s"
+overflow-checks = true # an arithmetic wrap-around stops the sandbox instead of silently continuing
 
 [profile.dev]
 panic = "abort"

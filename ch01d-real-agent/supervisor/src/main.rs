@@ -34,13 +34,14 @@ const PATH_LOG: u64 = 0x8050_0000; // our permanent copy of every path the agent
 const PATH_LOG_END: u64 = 0x8080_0000;
 const STATE: u64 = 0x8080_0000; // our per-process state (fd table, current folder, /tmp's file table)
 const SUP_STACK_TOP: u64 = 0x8100_0000;
+const SUP_STACK_SIZE: u64 = 0x4_0000; // 256 KiB, with unmapped guard pages below
 const AGENT_LO: u64 = 0x8100_0000; // everything the agent owns lives in [AGENT_LO, AGENT_HI)
 const AGENT_HI: u64 = 0x8800_0000;
 const DOORBELL: u64 = 0x0900_0000;
 
 #[repr(C)]
 struct BootInfo { entry: u64, sp: u64, brk_start: u64, brk_end: u64, mmap_start: u64, mmap_end: u64, rw_lo: u64, rw_hi: u64, tmp_lo: u64, tmp_hi: u64,
-                  warm: u64, elf_lo: u64, elf_hi: u64, stack_hi: u64, wall_ns: u64 }
+                  warm: u64, elf_lo: u64, elf_hi: u64, stack_hi: u64, wall_ns: u64, selftest: u64 }
 fn boot() -> &'static BootInfo { unsafe { &*(BOOT_INFO as *const BootInfo) } }
 
 // Doorbell requests, handled by the VMM.
@@ -128,6 +129,8 @@ struct State {
 }
 /// Only ever called once per trap: a single vCPU and no interrupts, so nothing else touches it.
 fn state() -> &'static mut State { unsafe { &mut *(STATE as *mut State) } }
+const STATE_SIZE: usize = 0x2_0000; // the VMM maps exactly this much (vmm/src/main.rs)
+const _: () = assert!(core::mem::size_of::<State>() <= STATE_SIZE);
 
 static BRK: AtomicU64 = AtomicU64::new(0);
 static MMAP_NEXT: AtomicU64 = AtomicU64::new(0);
@@ -227,7 +230,9 @@ pub struct TrapFrame { x: [u64; 32] } // x0..x30 + padding, laid out by el0_sync
 // ------------------------------- start-up -----------------------------------------------------
 #[unsafe(no_mangle)]
 extern "C" fn sup_main() -> ! {
-    const SCTLR_BITS: u64 = 1 | (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15); // MMU, caches, EL0 may use DC ZVA + CTR_EL0
+    // MMU, caches, EL0 may use DC ZVA + CTR_EL0, and WXN: any writable page is never executable,
+    // whatever its page-table entry says (a second lock behind the VMM's W^X page tables).
+    const SCTLR_BITS: u64 = 1 | (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 19);
     unsafe {
         asm!("ldr {0}, =vectors", "msr vbar_el1, {0}", out(reg) _); // 1. the door
         asm!(
@@ -264,6 +269,7 @@ extern "C" fn sup_main() -> ! {
         s.tmp_next = b.tmp_lo;
         tmp_create_root(s);
     }
+    if b.selftest != 0 { selftest(b.selftest); }
     if b.warm != 0 {
         // A warm sandbox: touch the pages the program is about to use, so KVM maps them now and not
         // one fault at a time during the call. Then wait (in the VMM) for the request, which writes
@@ -289,6 +295,31 @@ extern "C" fn sup_main() -> ! {
             options(noreturn),
         );
     }
+}
+
+/// `vmm --supervisor-selftest N`: the supervisor attacks its own memory, as an attacker who found a
+/// bug in it would. Each attack must end in a fault (the VMM reports "supervisor fault").
+fn selftest(n: u64) {
+    let code = sup_main as *const () as u64;
+    unsafe {
+        match n {
+            1 => (code as *mut u32).write_volatile(0xd503201f),               // patch our own code
+            2 => (POLICY as *mut u8).write_volatile(1),                      // allow every system call
+            3 => (PT_L1 as *mut u64).write_volatile(0),                      // edit the page tables
+            4 => ((BOOT_INFO + 8) as *mut u64).write_volatile(0),            // change the boot record
+            5 => { // write an instruction into our data, then jump to it
+                let at = STATE as *mut u32;
+                at.write_volatile(0xd65f03c0); // ret
+                let f: extern "C" fn() = core::mem::transmute(at);
+                f();
+            }
+            6 => ((SUP_STACK_TOP - SUP_STACK_SIZE - 8) as *mut u64).write_volatile(0), // just below our stack
+            7 => { core::ptr::read_volatile(0x8090_0000 as *const u64); }  // a gap between our regions
+            8 => { let at = "a constant string".as_ptr() as u64; (at as *mut u8).write_volatile(0); } // our constants
+            _ => {}
+        }
+    }
+    panic!("selftest {n} SURVIVED");
 }
 
 /// Map pages ahead of time: read the program's pages (they hold its code and data already) and

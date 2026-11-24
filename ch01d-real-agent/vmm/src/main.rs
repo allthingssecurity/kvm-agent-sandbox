@@ -50,8 +50,12 @@ const HC_TEXT: u64 = HC_PAGE + 64;
 const POLICY_PAGE: u64 = 0x8012_0000;
 const PT_BASE: u64 = 0x8020_0000;
 const LOG_BASE: u64 = 0x8040_0000;
-const SUP_LO: u64 = 0x8000_0000; // supervisor: code, boot info, doorbell page, policy, tables, notebook, stack
-const SUP_HI: u64 = 0x8100_0000;
+const PATH_LOG: u64 = 0x8050_0000;
+const PATH_LOG_END: u64 = 0x8080_0000;
+const STATE: u64 = 0x8080_0000;
+const STATE_SIZE: u64 = 0x2_0000;
+const SUP_STACK_TOP: u64 = 0x8100_0000;
+const SUP_STACK_SIZE: u64 = 0x4_0000;
 const ELF_LO: u64 = 0x8100_0000; // the agent's program pieces
 const ELF_HI: u64 = 0x8200_0000;
 const BRK_START: u64 = 0x8200_0000; // heap (brk)
@@ -76,7 +80,8 @@ const READ_ONLY: u64 = 1 << 7;
 const NO_EXEC_EL1: u64 = 1 << 53;
 const NO_EXEC_EL0: u64 = 1 << 54;
 
-const SUPERVISOR: &[u8] = include_bytes!("../../supervisor.bin");
+/// The supervisor as an ELF file: three segments (code, constants, data), each mapped with its own rights.
+const SUPERVISOR: &[u8] = include_bytes!("../../supervisor/target/aarch64-unknown-none-softfloat/release/supervisor");
 
 // Doorbell requests (must match the supervisor).
 const HC_WRITE: u64 = 1;
@@ -345,6 +350,44 @@ fn build_stack(ram: &GuestRam, prog: &Program, args: &[String]) -> io::Result<u6
 
 /// Identity-mapped page tables (guest virtual = guest physical), 4 KiB pages everywhere.
 /// These are plain bytes in guest RAM; the CPU uses them once the supervisor turns the MMU on.
+/// Load the supervisor's segments and map them W^X for level 0: code read-only and executable,
+/// constants read-only, data read-write and never executable. Level 3 can't touch any of it.
+fn load_supervisor(ram: &GuestRam, perms: &mut [u64]) -> io::Result<()> {
+    let f = SUPERVISOR;
+    let u16_at = |o: usize| u16::from_le_bytes(f[o..o + 2].try_into().unwrap()) as usize;
+    let u32_at = |o: usize| u32::from_le_bytes(f[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(f[o..o + 8].try_into().unwrap());
+    let (phoff, phnum) = (u64_at(32) as usize, u16_at(56));
+    for i in 0..phnum {
+        let ph = phoff + i * 56;
+        if u32_at(ph) != 1 { continue; }
+        let (flags, offset, vaddr, filesz, memsz) = (u32_at(ph + 4), u64_at(ph + 8) as usize, u64_at(ph + 16), u64_at(ph + 32) as usize, u64_at(ph + 40));
+        if vaddr < RAM_BASE || vaddr + memsz > BOOT_INFO || flags & 3 == 3 {
+            return Err(err("supervisor segment outside its area, or both writable and executable"));
+        }
+        ram.write_bytes(vaddr, &f[offset..offset + filesz]);
+        let bits = match flags & 7 { 5 => READ_ONLY | NO_EXEC_EL0, 4 => READ_ONLY | NO_EXEC_EL0 | NO_EXEC_EL1, _ => NO_EXEC_EL0 | NO_EXEC_EL1 };
+        for page in (vaddr & !0xfff..vaddr + memsz).step_by(4096) { perms[((page - RAM_BASE) >> 12) as usize] = bits; }
+    }
+    // The rest of the supervisor's area: only what it uses, each with the least it needs. The gaps
+    // stay unmapped, so a stray pointer or a runaway stack faults instead of reaching a neighbour.
+    let pt_end = PT_BASE + 0x3000 + (RAM_SIZE as u64 >> 21) * 0x1000;
+    let regions: [(u64, u64, u64); 8] = [
+        (BOOT_INFO, BOOT_INFO + 0x1000, READ_ONLY),               // boot record: the VMM writes it, we only read it
+        (HC_PAGE, HC_PAGE + 0x1000, 0),                           // doorbell requests
+        (POLICY_PAGE, POLICY_PAGE + 0x1000, READ_ONLY),           // the policy: read-only, even for the supervisor
+        (PT_BASE, pt_end, READ_ONLY),                             // page tables: the MMU reads them, nobody writes
+        (LOG_BASE, LOG_BASE + (64 + 10_000 * 48 + 0xfff & !0xfff), 0), // audit log
+        (PATH_LOG, PATH_LOG_END, 0),                              // copies of paths
+        (STATE, STATE + STATE_SIZE, 0),                           // fd table, current folder, /tmp's table
+        (SUP_STACK_TOP - SUP_STACK_SIZE, SUP_STACK_TOP, 0),       // the supervisor's stack, guard pages below
+    ];
+    for (lo, hi, extra) in regions {
+        for page in (lo..hi).step_by(4096) { perms[((page - RAM_BASE) >> 12) as usize] = NO_EXEC_EL0 | NO_EXEC_EL1 | extra; }
+    }
+    Ok(())
+}
+
 fn build_page_tables(ram: &GuestRam, perms: &[u64]) {
     let (l1, l2_low, l2_ram, l3_first) = (PT_BASE, PT_BASE + 0x1000, PT_BASE + 0x2000, PT_BASE + 0x3000);
     let entry = |table: u64, index: u64, value: u64| ram.write_u64(table + index * 8, value);
@@ -366,50 +409,85 @@ fn build_page_tables(ram: &GuestRam, perms: &[u64]) {
 /// The agent sees "/workspace/..."; on the host that is the policy's workspace folder. The
 /// supervisor checked the path already; we check again with the same policy and don't rely on it.
 struct OpenFile { file: File, listing: Option<(Vec<(Vec<u8>, u64, u8)>, usize)> } // folder: entries + position
-struct Files { root: PathBuf, read: Vec<String>, max_open: usize, open: Vec<Option<OpenFile>> }
+/// Files beneath the workspace. Every open goes through openat2(RESOLVE_BENEATH) from one handle on
+/// the workspace folder: the kernel itself refuses any path, symbolic link or ".." that would leave it,
+/// in the same step as the open, so nothing can be swapped between a check and the open.
+struct Files { root: OwnedFd, read: Vec<String>, max_open: usize, open: Vec<Option<OpenFile>> }
 fn io_errno(e: &io::Error) -> i64 { -(e.raw_os_error().unwrap_or(2) as i64) }
+fn last_errno() -> i64 { io_errno(&io::Error::last_os_error()) }
+const MAX_DIR_ENTRIES: usize = 100_000;
+
+fn fstat(fd: RawFd) -> Result<libc::stat, i64> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 { Err(last_errno()) } else { Ok(st) }
+}
+
+/// A folder's entries, read from its open handle (Linux's getdents64 records), "." and ".." included.
+fn list_dir(fd: RawFd) -> Result<Vec<(Vec<u8>, u64, u8)>, i64> {
+    let (mut entries, mut buf) = (Vec::new(), vec![0u8; 32 << 10]);
+    loop {
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.len()) };
+        if n < 0 { return Err(last_errno()); }
+        if n == 0 { return Ok(entries); }
+        let mut off = 0usize;
+        while off + 19 <= n as usize {
+            let ino = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            let reclen = u16::from_le_bytes(buf[off + 16..off + 18].try_into().unwrap()) as usize;
+            if reclen < 20 || off + reclen > n as usize { return Err(-errno("EINVAL")); }
+            let name = &buf[off + 19..off + reclen];
+            entries.push((name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())].to_vec(), ino, buf[off + 18]));
+            if entries.len() > MAX_DIR_ENTRIES { return Err(-errno("ENOMEM")); }
+            off += reclen;
+        }
+    }
+}
+
 impl Files {
-    /// Guest path -> host path. The supervisor sent a clean path; we check it again anyway.
-    fn host_path(&self, guest: &str) -> Result<PathBuf, i64> {
+    /// Guest path -> path relative to the workspace. The supervisor sent a clean path; check again anyway.
+    fn relative(&self, guest: &str) -> Result<CString, i64> {
         if !self.read.iter().any(|p| guest.starts_with(p.as_str()) || p.strip_suffix('/') == Some(guest)) {
             return Err(-errno("EACCES"));
         }
-        let rest = if guest == "/workspace" { "" } else { guest.strip_prefix("/workspace/").ok_or(-errno("EACCES"))? };
-        if !rest.is_empty() && rest.split('/').any(|p| p.is_empty() || p == "." || p == "..") { return Err(-errno("EACCES")); }
-        Ok(self.root.join(rest))
+        let rest = if guest == "/workspace" { "." } else { guest.strip_prefix("/workspace/").ok_or(-errno("EACCES"))? };
+        if rest != "." && rest.split('/').any(|p| p.is_empty() || p == "." || p == "..") { return Err(-errno("EACCES")); }
+        CString::new(rest).map_err(|_| -errno("EINVAL"))
     }
-    /// Follow symbolic links, then insist the result is still inside the workspace.
-    fn inside(&self, full: &Path) -> Result<PathBuf, i64> {
-        let real = full.canonicalize().map_err(|e| io_errno(&e))?;
-        if real.starts_with(&self.root) { Ok(real) } else { Err(-errno("EACCES")) }
-    }
-    /// For lstat and readlink: the last part is not followed, but its folder must be inside.
-    fn inside_nofollow(&self, full: &Path) -> Result<PathBuf, i64> {
-        match (full.parent(), full.file_name()) {
-            (Some(dir), Some(name)) if full != self.root => Ok(self.inside(dir)?.join(name)),
-            _ => self.inside(full),
+    fn beneath(&self, guest: &str, flags: i32) -> Result<OwnedFd, i64> {
+        #[repr(C)]
+        struct OpenHow { flags: u64, mode: u64, resolve: u64 }
+        const RESOLVE_NO_XDEV: u64 = 1; // don't cross into another mounted file system
+        const RESOLVE_NO_MAGICLINKS: u64 = 2; // no /proc-style magic links
+        const RESOLVE_BENEATH: u64 = 8; // never leave the starting folder
+        let rel = self.relative(guest)?;
+        let how = OpenHow { flags: (flags | libc::O_CLOEXEC) as u64, mode: 0, resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV };
+        let fd = unsafe { libc::syscall(libc::SYS_openat2, self.root.as_raw_fd(), rel.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
+        if fd < 0 {
+            let e = last_errno();
+            return Err(if e == -(libc::EXDEV as i64) { -errno("EACCES") } else { e }); // EXDEV: it tried to leave
         }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
     }
     fn open(&mut self, guest: &str, want_dir: bool) -> i64 {
-        let real = match self.host_path(guest).and_then(|f| self.inside(&f)) { Ok(r) => r, Err(e) => return e };
         if self.open.iter().flatten().count() >= self.max_open { return -errno("EMFILE"); }
-        let file = match File::open(&real) { Ok(f) => f, Err(e) => return io_errno(&e) };
-        let is_dir = file.metadata().map(|m| m.is_dir()).unwrap_or(false);
-        if want_dir && !is_dir { return -errno("ENOTDIR"); }
-        let listing = if is_dir {
-            use std::os::unix::fs::DirEntryExt;
-            let mut entries = vec![(b".".to_vec(), 1, 4), (b"..".to_vec(), 1, 4)];
-            match std::fs::read_dir(&real) {
-                Ok(dir) => for e in dir.flatten() {
-                    let kind = e.file_type().map(|t| if t.is_dir() { 4 } else if t.is_symlink() { 10 } else if t.is_file() { 8 } else { 0 }).unwrap_or(0);
-                    entries.push((e.file_name().as_bytes().to_vec(), e.ino(), kind));
-                },
-                Err(e) => return io_errno(&e),
-            }
-            Some((entries, 0))
-        } else { None };
-        self.open.push(Some(OpenFile { file, listing }));
+        let fd = match self.beneath(guest, libc::O_RDONLY | if want_dir { libc::O_DIRECTORY } else { 0 }) { Ok(fd) => fd, Err(e) => return e };
+        let is_dir = match fstat(fd.as_raw_fd()) { Ok(st) => st.st_mode & libc::S_IFMT == libc::S_IFDIR, Err(e) => return e };
+        let listing = if is_dir { match list_dir(fd.as_raw_fd()) { Ok(v) => Some((v, 0)), Err(e) => return e } } else { None };
+        self.open.push(Some(OpenFile { file: File::from(fd), listing }));
         (2 + self.open.len() as i64) | ((is_dir as i64) << 32)
+    }
+    /// stat or lstat, through a handle that can't do anything but describe (O_PATH).
+    fn stat(&self, guest: &str, nofollow: bool) -> Result<libc::stat, i64> {
+        let fd = self.beneath(guest, libc::O_PATH | if nofollow { libc::O_NOFOLLOW } else { 0 })?;
+        fstat(fd.as_raw_fd())
+    }
+    fn readlink(&self, guest: &str) -> Result<Vec<u8>, i64> {
+        let fd = self.beneath(guest, libc::O_PATH | libc::O_NOFOLLOW)?;
+        if fstat(fd.as_raw_fd())?.st_mode & libc::S_IFMT != libc::S_IFLNK { return Err(-errno("EINVAL")); }
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe { libc::readlinkat(fd.as_raw_fd(), c"".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 { return Err(last_errno()); }
+        buf.truncate(n as usize);
+        Ok(buf)
     }
     fn get(&mut self, fd: u64) -> Option<&mut OpenFile> {
         fd.checked_sub(3).and_then(|i| self.open.get_mut(i as usize)).and_then(|f| f.as_mut())
@@ -417,15 +495,16 @@ impl Files {
 }
 
 /// Linux's arm64 `struct stat`, with host details hidden: owner, device and link counts are made up.
-fn stat_bytes(m: &std::fs::Metadata) -> [u8; 128] {
-    use std::os::unix::fs::MetadataExt;
+fn stat_bytes(st: &libc::stat) -> [u8; 128] {
     let mut b = [0u8; 128];
     let mut put = |off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
-    put(0, &1u64.to_le_bytes()); put(8, &m.ino().to_le_bytes()); put(16, &m.mode().to_le_bytes());
-    put(20, &(if m.is_dir() { 2u32 } else { 1 }).to_le_bytes()); put(24, &1000u32.to_le_bytes()); put(28, &1000u32.to_le_bytes());
-    put(48, &m.size().to_le_bytes()); put(56, &4096u32.to_le_bytes()); put(64, &m.size().div_ceil(512).to_le_bytes());
-    for (off, t, ns) in [(72, m.atime(), m.atime_nsec()), (88, m.mtime(), m.mtime_nsec()), (104, m.ctime(), m.ctime_nsec())] {
-        put(off, &t.to_le_bytes()); put(off + 8, &ns.to_le_bytes());
+    let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    let size = st.st_size as u64;
+    put(0, &1u64.to_le_bytes()); put(8, &(st.st_ino as u64).to_le_bytes()); put(16, &st.st_mode.to_le_bytes());
+    put(20, &(if is_dir { 2u32 } else { 1 }).to_le_bytes()); put(24, &1000u32.to_le_bytes()); put(28, &1000u32.to_le_bytes());
+    put(48, &size.to_le_bytes()); put(56, &4096u32.to_le_bytes()); put(64, &size.div_ceil(512).to_le_bytes());
+    for (off, t, ns) in [(72, st.st_atime, st.st_atime_nsec), (88, st.st_mtime, st.st_mtime_nsec), (104, st.st_ctime, st.st_ctime_nsec)] {
+        put(off, &(t as i64).to_le_bytes()); put(off + 8, &(ns as i64).to_le_bytes());
     }
     b
 }
@@ -453,13 +532,14 @@ fn dirents(entries: &[(Vec<u8>, u64, u8)], pos: &mut usize, out: &mut [u8]) -> i
 /// Host system calls this VMM still needs once the agent runs. Everything else kills the VMM.
 const VMM_SYSCALLS: &[u32] = &[
     17,                // getcwd
-    56, 57, 61, 62, 63, // openat (limited by Landlock), close, getdents64 (folders), lseek, read
+    57, 61, 62, 63,    // close, getdents64 (folders), lseek, read
+    437,               // openat2 (RESOLVE_BENEATH the workspace; Landlock: read-only)
     78, 79, 80, 291,   // readlinkat (canonicalize), newfstatat, fstat, statx
     93, 94,            // exit, exit_group
     98, 101, 113, 115, 124, // futex, nanosleep, clock_gettime, clock_nanosleep, sched_yield
     135, 139, 132,     // rt_sigprocmask, rt_sigreturn, sigaltstack
     172, 178,          // getpid, gettid
-    214, 215, 216, 222, 226, 233, // brk, munmap, mremap, mmap, mprotect, madvise (our own memory)
+    214, 215, 216, 233, // brk, munmap, mremap, madvise (our own memory; mmap and mprotect: below)
     278,               // getrandom
 ];
 
@@ -474,7 +554,8 @@ fn install_seccomp() -> io::Result<usize> {
     const ALLOW: u32 = 0x7fff_0000;
     const KILL: u32 = 0x8000_0000; // kill the whole process
     const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
-    let (nr_off, arch_off, arg0_lo, arg1_lo) = (0, 4, 16, 24);
+    const JSET: u16 = 0x45; // jump if (A & k) != 0
+    let (nr_off, arch_off, arg0_lo, arg1_lo, arg2_lo) = (0, 4, 16, 24, 32);
     let f = |code, k, jt, jf| SockFilter { code, jt, jf, k };
 
     let mut prog = vec![
@@ -507,6 +588,23 @@ fn install_seccomp() -> io::Result<usize> {
         prog.push(f(RET, KILL, 0, 0));
         prog.push(f(RET, ALLOW, 0, 0));
     }
+    // System calls allowed unless an argument has a forbidden bit set:
+    //   mmap, mprotect: never PROT_EXEC. A VMM taken over by an attacker gets no executable memory
+    //                   for injected code (it can only reuse code that's already there).
+    //   openat:         never for writing or creating (O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND).
+    let forbidden_bits: [(u32, u32, u32); 3] = [
+        (222, arg2_lo, libc::PROT_EXEC as u32),
+        (226, arg2_lo, libc::PROT_EXEC as u32),
+        (56, arg2_lo, (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32),
+    ];
+    for (nr, arg, bits) in forbidden_bits {
+        prog.push(f(LD_ABS, nr_off, 0, 0));
+        prog.push(f(JEQ, nr, 0, 4)); // not this call: skip the block
+        prog.push(f(LD_ABS, arg, 0, 0));
+        prog.push(f(JSET, bits, 0, 1)); // a forbidden bit set: kill, else allow
+        prog.push(f(RET, KILL, 0, 0));
+        prog.push(f(RET, ALLOW, 0, 0));
+    }
     prog.push(f(RET, KILL, 0, 0)); // anything else
 
     let fprog = SockFprog { len: prog.len() as u16, filter: prog.as_ptr() };
@@ -514,7 +612,7 @@ fn install_seccomp() -> io::Result<usize> {
     const SECCOMP_FILTER_FLAG_TSYNC: u64 = 1; // apply to every thread (the watchdog too)
     let r = unsafe { libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &fprog) };
     if r != 0 { return Err(err(format!("seccomp: {}", io::Error::last_os_error()))); }
-    Ok(VMM_SYSCALLS.len() + restricted.len())
+    Ok(VMM_SYSCALLS.len() + restricted.len() + forbidden_bits.len())
 }
 
 /// Landlock: an unprivileged process limits its own file access. Afterwards this VMM can open
@@ -529,12 +627,15 @@ fn landlock_readonly(dir: &Path) -> Result<i64, String> {
     let handled: u64 = match abi { 1 => (1 << 13) - 1, 2 => (1 << 14) - 1, 3 | 4 => (1 << 15) - 1, _ => (1 << 16) - 1 };
     const READ_FILE: u64 = 1 << 2;
     const READ_DIR: u64 = 1 << 3;
+    // ABI 4+: TCP bind/connect are "handled" too, and never granted. ABI 6+: "scoped": no signals to,
+    // and no abstract Unix sockets with, processes outside this sandbox (other sandboxes included).
     #[repr(C)]
-    struct RulesetAttr { handled_access_fs: u64 }
+    struct RulesetAttr { handled_access_fs: u64, handled_access_net: u64, scoped: u64 }
     #[repr(C, packed)]
     struct PathBeneath { allowed_access: u64, parent_fd: i32 }
-    let attr = RulesetAttr { handled_access_fs: handled };
-    let ruleset = unsafe { libc::syscall(CREATE_RULESET, &attr, std::mem::size_of::<RulesetAttr>(), 0u32) };
+    let attr = RulesetAttr { handled_access_fs: handled, handled_access_net: if abi >= 4 { 1 | 2 } else { 0 }, scoped: if abi >= 6 { 1 | 2 } else { 0 } };
+    let size = match abi { 1..=3 => 8usize, 4 | 5 => 16, _ => 24 };
+    let ruleset = unsafe { libc::syscall(CREATE_RULESET, &attr, size, 0u32) };
     if ruleset < 0 { return Err(format!("create ruleset: {}", io::Error::last_os_error())); }
     let cpath = CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     let dirfd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
@@ -555,12 +656,44 @@ fn jail(workspace: &Path) -> io::Result<String> {
     limit(libc::RLIMIT_NOFILE, 64);
     // Required to use Landlock and seccomp without root; also blocks gaining privileges via setuid files.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 { return Err(io::Error::last_os_error()); }
+    // Not dumpable: other processes of the same user (other sandboxes, too) can't read our memory or
+    // our /proc files, which hold the guest's memory and state.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 { return Err(io::Error::last_os_error()); }
     let landlock = match landlock_readonly(workspace) {
-        Ok(abi) => format!("Landlock v{abi}: files limited to {} (read-only)", workspace.display()),
+        Ok(abi) => format!("Landlock v{abi}: files limited to {} (read-only){}{}", workspace.display(),
+                           if abi >= 4 { "; no TCP" } else { "" }, if abi >= 6 { "; signals and abstract sockets only within itself" } else { "" }),
         Err(why) => format!("Landlock {why}: relying on seccomp + checks only"),
     };
     let n = install_seccomp()?;
-    Ok(format!("seccomp: {n} host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only)\n     {landlock}\n     rlimits: no new processes, no core dumps, 64 open files"))
+    Ok(format!("seccomp: {n} host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only, no executable memory, no write opens)\n     {landlock}\n     rlimits: no new processes, no core dumps, 64 open files; not dumpable"))
+}
+
+/// `--jail-test NAME`: one thing a compromised VMM would try, after the jail is on. Each must fail:
+/// refused by the kernel, or the VMM killed by seccomp (exit status 159 = SIGSYS).
+fn jail_test(name: &str, workspace_file: &Path, parent: u32) {
+    let _ = io::stdout().flush();
+    let r: i64 = unsafe {
+        match name {
+            "read-etc-passwd" => match File::open("/etc/passwd") { Ok(_) => 0, Err(e) => -(e.raw_os_error().unwrap_or(0) as i64) },
+            "open-workspace-for-writing" => {
+                let p = CString::new(workspace_file.as_os_str().as_bytes()).unwrap();
+                libc::syscall(libc::SYS_openat, libc::AT_FDCWD, p.as_ptr(), libc::O_WRONLY) as i64
+            }
+            "executable-memory" => libc::syscall(libc::SYS_mmap, 0, 4096, libc::PROT_READ | libc::PROT_EXEC, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) as i64,
+            "make-memory-executable" => {
+                let page = libc::syscall(libc::SYS_mmap, 0, 4096, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+                libc::syscall(libc::SYS_mprotect, page, 4096, libc::PROT_READ | libc::PROT_EXEC) as i64
+            }
+            "network" => libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as i64,
+            "signal-another-process" => libc::syscall(libc::SYS_tkill, parent, libc::SIGUSR1) as i64,
+            "start-a-program" => libc::syscall(libc::SYS_execve, c"/bin/sh".as_ptr(), std::ptr::null::<u8>(), std::ptr::null::<u8>()) as i64,
+            "new-process" => libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0) as i64,
+            _ => { println!("jail-test: unknown test"); return; }
+        }
+    };
+    let errno = io::Error::last_os_error();
+    if r < 0 { println!("jail-test {name}: REFUSED ({})", if r == -1 { errno.to_string() } else { io::Error::from_raw_os_error(-r as i32).to_string() }); }
+    else { println!("jail-test {name}: SUCCEEDED (returned {r}): the jail did NOT stop it"); }
 }
 
 /// Try two things a compromised VMM would do, to prove the jail holds.
@@ -652,6 +785,9 @@ fn main() -> io::Result<()> {
     // VMM_TIMINGS=1: where the time of one run goes, printed to stderr at the end.
     let timings = std::env::var_os("VMM_TIMINGS").is_some();
     let mut marks: Vec<(&str, Instant)> = vec![("start", t0)];
+    let mut sup_selftest = 0u64;
+    let mut jail_test_name: Option<String> = None;
+    let parent = std::os::unix::process::parent_id();
     let (mut policy_path, mut agent_path, mut agent_args, mut selftest) =
         ("policies/default.policy".to_string(), None, vec!["agent".to_string()], false);
     let mut args = std::env::args().skip(1);
@@ -659,7 +795,9 @@ fn main() -> io::Result<()> {
         match a.as_str() {
             "--policy" => policy_path = args.next().ok_or_else(|| err("--policy needs a file"))?,
             "--jail-selftest" => selftest = true,
+            "--jail-test" => jail_test_name = args.next(),
             "--warm" => WARM.store(true, Ordering::SeqCst),
+            "--supervisor-selftest" => sup_selftest = args.next().and_then(|n| n.parse().ok()).ok_or_else(|| err("--supervisor-selftest needs a number"))?,
             "--" => { agent_args.extend(args.by_ref()); }
             _ => agent_path = Some(a),
         }
@@ -669,7 +807,13 @@ fn main() -> io::Result<()> {
     let policy = parse_policy(&policy_path)?;
     let elf = std::fs::read(&agent_path).map_err(|e| err(format!("{agent_path}: {e}")))?;
     let root = policy.workspace.canonicalize().map_err(|e| err(format!("workspace {}: {e}", policy.workspace.display())))?;
-    let mut files = Files { root: root.clone(), read: policy.read.clone(), max_open: policy.max_open_files, open: Vec::new() };
+    let root_fd = {
+        let p = CString::new(root.as_os_str().as_bytes()).map_err(|_| err("workspace path"))?;
+        let fd = unsafe { libc::open(p.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+    let mut files = Files { root: root_fd, read: policy.read.clone(), max_open: policy.max_open_files, open: Vec::new() };
 
     marks.push(("args, policy, read ELF", Instant::now()));
     // 1. VM + guest RAM, as in chapter 1.
@@ -694,10 +838,9 @@ fn main() -> io::Result<()> {
 
     marks.push(("create VM + memory slot", Instant::now()));
     // 2. Supervisor, policy, the agent's program (like execve), page tables, stack, boot record.
-    ram.write_bytes(RAM_BASE, SUPERVISOR);
     write_policy_page(&ram, &policy);
     let mut perms = vec![0u64; RAM_SIZE / 4096];
-    for page in (SUP_LO..SUP_HI).step_by(4096) { perms[((page - RAM_BASE) >> 12) as usize] = NO_EXEC_EL0; } // level 0 only
+    load_supervisor(&ram, &mut perms)?;
     let prog = load_elf(&ram, &elf, &mut perms)?;
     // Heap, the first memory_mb of the mmap area, and the stack: the agent's, never executable. The
     // rest of the mmap area stays unmapped, so the memory limit holds even against direct stores.
@@ -717,7 +860,7 @@ fn main() -> io::Result<()> {
     let agent_mem = |gpa: u64, len: u64| gpa.checked_add(len).is_some_and(|end|
         (gpa >= ELF_LO && end <= mmap_end) || (gpa >= STACK_LO && end <= STACK_HI));
     for (i, v) in [prog.entry, sp, BRK_START, BRK_END, MMAP_START, mmap_end, prog.rw_lo, prog.rw_hi, TMP_LO, tmp_hi,
-                                     if !warm { 0 } else if std::env::var_os("VMM_NO_PREFAULT").is_some() { 2 } else { 1 }, prog.lo, prog.hi, STACK_HI, wall_ns()].into_iter().enumerate() {
+                                     if !warm { 0 } else if std::env::var_os("VMM_NO_PREFAULT").is_some() { 2 } else { 1 }, prog.lo, prog.hi, STACK_HI, wall_ns(), sup_selftest].into_iter().enumerate() {
         ram.write_u64(BOOT_INFO + i as u64 * 8, v);
     }
 
@@ -732,19 +875,38 @@ fn main() -> io::Result<()> {
     let pc = RAM_BASE;
     ioctl(vcpu.as_raw_fd(), KVM_SET_ONE_REG, &OneReg { id: REG_PC, addr: &pc as *const _ as u64 } as *const _ as u64)?;
 
+    // Hide KVM's optional firmware services (random numbers, paravirtual time, vendor calls) from the
+    // guest: the supervisor needs none of them, so a compromised supervisor can't reach that code either.
+    let fw_hidden = (0..3u64).filter(|i| {
+        let zero = 0u64;
+        ioctl(vcpu.as_raw_fd(), KVM_SET_ONE_REG, &OneReg { id: 0x6030_0000_0016_0000 | i, addr: &zero as *const _ as u64 } as *const _ as u64).is_ok()
+    }).count();
     marks.push(("create vCPU + init", Instant::now()));
     // 4. Watchdog, then lock this process down. From here on the VMM can't open sockets, start
     //    programs or read anything outside the workspace, even if the agent took it over.
+    // Namespaces: its own user namespace, IPC and host name (and optionally an empty network stack).
+    // Must happen while we are single-threaded.
+    // Default "nonet": a new network namespace costs ~0.1 ms to create but Linux tears it down in one
+    // background worker, which capped throughput at ~320/s (from ~500/s) in our measurements. The
+    // network is already closed twice (seccomp kills socket(); Landlock refuses TCP).
+    // VMM_NAMESPACES=net adds it anyway; =none for comparison.
+    let ns_mode = std::env::var("VMM_NAMESPACES").unwrap_or_else(|_| "nonet".into());
+    let ns_flags = match ns_mode.as_str() { "none" => 0, "nonet" => libc::CLONE_NEWUSER | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS,
+                                            _ => libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS };
+    let namespaces = ns_flags != 0 && unsafe { libc::unshare(ns_flags) } == 0;
     let go = start_watchdog(policy.time_limit, run);
     let jail_status = jail(&root)?;
     if !warm {
     println!("VMM: policy {policy_path}: time {} ms, memory {} MB, output {} KB, open files {}, read {:?}",
              policy.time_limit.as_millis(), policy.memory_mb, policy.max_output >> 10, policy.max_open_files, policy.read);
     println!("VMM: jail: {jail_status}");
+    println!("VMM: supervisor mapped W^X (WXN on); KVM firmware services hidden: {fw_hidden} of 3; namespaces: {}",
+             if !namespaces { "not available".to_string() } else if ns_mode == "net" { "user, IPC, UTS, network (empty)".into() } else { "user, IPC, UTS".into() });
     println!("VMM: agent {agent_path} {:?} ({} KB), entry {:#x}\n", &agent_args[1..], elf.len() / 1024, prog.entry);
     go.send(()).ok();
     }
     if selftest { jail_selftest(); return Ok(()); }
+    if let Some(name) = &jail_test_name { jail_test(name, &root.join("notes.txt"), parent); return Ok(()); }
 
     marks.push(("watchdog + jail (seccomp, Landlock)", Instant::now()));
     // 5. Run. Every exit is a doorbell ring from the supervisor (or the watchdog).
@@ -798,37 +960,28 @@ fn main() -> io::Result<()> {
                 None => -errno("EBADF"),
             },
             HC_FSTAT => match (files.get(a), ram.slice_mut(b, 128).filter(|_| agent_mem(b, 128))) {
-                (Some(f), Some(buf)) => match f.file.metadata() { Ok(m) => { buf.copy_from_slice(&stat_bytes(&m)); 0 } Err(e) => io_errno(&e) },
+                (Some(f), Some(buf)) => match fstat(f.file.as_raw_fd()) { Ok(st) => { buf.copy_from_slice(&stat_bytes(&st)); 0 } Err(e) => e },
                 (None, _) => -errno("EBADF"),
                 (_, None) => -errno("EFAULT"),
             },
-            HC_STAT => { // a = the path (in the doorbell page), b = where to put it (0: just the type), c = don't follow
-                let guest = ram.c_string(HC_TEXT);
-                let found = files.host_path(&guest).and_then(|f| if c != 0 { files.inside_nofollow(&f) } else { files.inside(&f) })
-                    .and_then(|real| if c != 0 { std::fs::symlink_metadata(&real) } else { std::fs::metadata(&real) }.map_err(|e| io_errno(&e)));
-                match (found, b) {
-                    (Err(e), _) => e,
-                    (Ok(m), 0) => { use std::os::unix::fs::MetadataExt; m.mode() as i64 }
-                    (Ok(m), _) => match ram.slice_mut(b, 128).filter(|_| agent_mem(b, 128)) {
-                        Some(buf) => { buf.copy_from_slice(&stat_bytes(&m)); { use std::os::unix::fs::MetadataExt; m.mode() as i64 } }
+            HC_STAT => match files.stat(&ram.c_string(HC_TEXT), c != 0) { // b = where to put it (0: just the type), c = lstat
+                Err(e) => e,
+                Ok(st) if b == 0 => st.st_mode as i64,
+                Ok(st) => match ram.slice_mut(b, 128).filter(|_| agent_mem(b, 128)) {
+                    Some(buf) => { buf.copy_from_slice(&stat_bytes(&st)); st.st_mode as i64 }
+                    None => -errno("EFAULT"),
+                },
+            },
+            HC_READLINK => match files.readlink(&ram.c_string(HC_TEXT)) {
+                Err(e) => e,
+                Ok(target) => {
+                    let n = target.len().min(c as usize) as u64;
+                    match ram.slice_mut(b, n).filter(|_| agent_mem(b, n)) {
+                        Some(buf) => { buf.copy_from_slice(&target[..n as usize]); n as i64 }
                         None => -errno("EFAULT"),
-                    },
-                }
-            }
-            HC_READLINK => {
-                let guest = ram.c_string(HC_TEXT);
-                match files.host_path(&guest).and_then(|f| files.inside_nofollow(&f)).and_then(|r| std::fs::read_link(r).map_err(|e| io_errno(&e))) {
-                    Err(e) => e,
-                    Ok(target) => {
-                        let t = target.as_os_str().as_bytes();
-                        let n = t.len().min(c as usize) as u64;
-                        match ram.slice_mut(b, n).filter(|_| agent_mem(b, n)) {
-                            Some(buf) => { buf.copy_from_slice(&t[..n as usize]); n as i64 }
-                            None => -errno("EFAULT"),
-                        }
                     }
                 }
-            }
+            },
             HC_GETDENTS => match (files.get(a), ram.slice_mut(b, c).filter(|_| agent_mem(b, c))) {
                 (Some(OpenFile { listing: Some((entries, pos)), .. }), Some(buf)) => dirents(entries, pos, buf),
                 (Some(_), Some(_)) => -errno("ENOTDIR"),

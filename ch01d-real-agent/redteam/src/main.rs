@@ -293,11 +293,28 @@ fn fuzz(seed: u64, n: u64) {
     unsafe { sc(94, [77, 0, 0, 0, 0, 0]); }
 }
 
+/// Open /workspace/d/passwd over and over while something on the host swaps `d` between a real
+/// folder (holding a harmless file called passwd) and a symbolic link to /etc. Any read that returns
+/// the host's /etc/passwd ("root:") is a leak.
+fn race(n: u64) {
+    let mut buf = [0u8; 64];
+    let (mut inside, mut refused, mut leaked) = (0, 0, 0);
+    for _ in 0..n {
+        let fd = open(b"/workspace/d/passwd\0", 0);
+        if fd < 0 { refused += 1; continue; }
+        let r = sys(63, &[fd as u64, buf.as_mut_ptr() as u64, 64]);
+        if r > 0 && buf.starts_with(b"root:") { leaked += 1 } else { inside += 1 }
+        sys(57, &[fd as u64]);
+    }
+    println!("race: {n} opens: {inside} read the workspace's own file, {refused} refused or missing, {leaked} LEAKED the host's /etc/passwd");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("probe") => probe(),
         Some("fatal") => fatal(args.get(2).map_or("", |s| s.as_str())),
+        Some("race") => race(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3000)),
         Some("fuzz") => fuzz(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5000)),
         _ => println!("usage: redteam probe | fatal NAME | fuzz SEED N"),
     }

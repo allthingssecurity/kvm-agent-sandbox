@@ -1,12 +1,17 @@
 #!/bin/sh
 # Run real, unmodified tools in the sandbox: Alpine's static busybox (a static PIE, not recompiled).
 # Inside the Linux VM:  limactl shell vmm ./compat/run-busybox.sh
-# Needs: apk add busybox-static  (the script copies /bin/busybox.static to compat/bin/busybox).
+# Needs a static busybox: Alpine: apk add busybox-static; Debian/Ubuntu: apt install busybox-static.
 cd "$(dirname "$0")/.."
 V=./vmm/target/aarch64-unknown-linux-musl/release/vmm
 B=compat/bin/busybox
 mkdir -p compat/bin
-[ -x $B ] || cp /bin/busybox.static $B || { echo "install busybox-static first"; exit 1; }
+if [ ! -x $B ]; then
+    for c in /bin/busybox.static /bin/busybox /usr/bin/busybox; do
+        if [ -x "$c" ] && [ "$(head -c 4 "$c" | tail -c 3)" = ELF ] && ! grep -q "/lib/ld-" "$c"; then cp "$c" $B; break; fi
+    done
+    [ -x $B ] || { echo "no static busybox found: Alpine: apk add busybox-static, Debian/Ubuntu: apt install busybox-static"; exit 1; }
+fi
 
 printf '%-62s %-10s %6s %9s\n' "command (cwd = /workspace)" "result" "exits" "time"
 run() {
