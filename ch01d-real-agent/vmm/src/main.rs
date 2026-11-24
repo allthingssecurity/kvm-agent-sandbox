@@ -94,6 +94,7 @@ const HC_SLEEP: u64 = 12;
 const HC_STAT: u64 = 13;
 const HC_READLINK: u64 = 14;
 const HC_GETDENTS: u64 = 15;
+const HC_READY: u64 = 16;
 
 /// Linux arm64 system call numbers, for policies and reports.
 const SYSCALLS: &[(&str, u64)] = &[
@@ -147,6 +148,7 @@ fn mmap(len: usize, fd: RawFd, flags: i32) -> io::Result<*mut u8> {
     let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, flags, fd, 0) };
     if p == libc::MAP_FAILED { Err(io::Error::last_os_error()) } else { Ok(p.cast()) }
 }
+fn wall_ns() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0) }
 fn err(msg: impl Into<String>) -> io::Error { io::Error::other(msg.into()) }
 fn host_random(buf: &mut [u8]) -> io::Result<()> {
     let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
@@ -259,7 +261,7 @@ fn write_policy_page(ram: &GuestRam, p: &Policy) {
 }
 
 // ------------------------------- loading the program (what execve does) -----------------------
-struct Program { entry: u64, phdr: u64, phnum: u64, rw_lo: u64, rw_hi: u64 }
+struct Program { entry: u64, phdr: u64, phnum: u64, rw_lo: u64, rw_hi: u64, lo: u64, hi: u64 }
 
 /// Load a static arm64 ELF executable's PT_LOAD pieces at their addresses and record per-page
 /// permissions for the page tables.
@@ -281,7 +283,7 @@ fn load_elf(ram: &GuestRam, file: &[u8], perms: &mut [u64]) -> io::Result<Progra
     if phentsize < 56 || phoff.checked_add(phnum as usize * phentsize).is_none_or(|end| end > file.len()) {
         return Err(err("bad program headers"));
     }
-    let (mut phdr, mut rw_lo, mut rw_hi) = (0, u64::MAX, 0);
+    let (mut phdr, mut rw_lo, mut rw_hi, mut lo, mut hi) = (0, u64::MAX, 0, u64::MAX, 0);
     for i in 0..phnum as usize {
         let ph = phoff + i * phentsize;
         let (kind, flags, offset, vaddr) = (u32_at(ph), u32_at(ph + 4), u64_at(ph + 8) as usize, u64_at(ph + 16));
@@ -295,6 +297,7 @@ fn load_elf(ram: &GuestRam, file: &[u8], perms: &mut [u64]) -> io::Result<Progra
                     return Err(err(format!("segment at {vaddr:#x} is outside the agent's program area")));
                 }
                 ram.write_bytes(vaddr, &file[offset..offset + filesz]); // the rest (bss) is already zero
+                (lo, hi) = (lo.min(vaddr), hi.max(end));
                 if offset <= phoff && phoff + phnum as usize * phentsize <= offset + filesz {
                     phdr = vaddr + (phoff - offset) as u64; // where the program headers are mapped (AT_PHDR)
                 }
@@ -312,7 +315,7 @@ fn load_elf(ram: &GuestRam, file: &[u8], perms: &mut [u64]) -> io::Result<Progra
     }
     if phdr == 0 { return Err(err("program headers not inside a loaded segment")); }
     if rw_lo == u64::MAX { rw_lo = 0; }
-    Ok(Program { entry, phdr, phnum, rw_lo, rw_hi })
+    Ok(Program { entry, phdr, phnum, rw_lo, rw_hi, lo, hi })
 }
 
 /// The starting stack Linux gives every program: argc, argv, envp, then the auxiliary vector.
@@ -579,11 +582,13 @@ extern "C" fn on_watchdog_signal(_: libc::c_int) {} // its only job: make KVM_RU
 
 /// After `limit`, stop the vCPU: set kvm_run.immediate_exit (in case we are between runs) and
 /// signal the vCPU thread (in case it is inside KVM_RUN, which then returns EINTR).
-fn start_watchdog(limit: Duration, run: *mut KvmRun) {
+fn start_watchdog(limit: Duration, run: *mut KvmRun) -> std::sync::mpsc::Sender<()> {
     let act = libc::sigaction { sa_sigaction: on_watchdog_signal as *const () as usize, sa_mask: unsafe { std::mem::zeroed() }, sa_flags: 0, sa_restorer: None };
     unsafe { libc::sigaction(libc::SIGUSR1, &act, std::ptr::null_mut()) }; // no SA_RESTART: KVM_RUN must return
     let (vcpu_thread, run) = (unsafe { libc::pthread_self() } as usize, run as usize);
+    let (go, started) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
+        if started.recv().is_err() { return; } // the clock starts when the program starts (warm sandboxes wait first)
         std::thread::sleep(limit);
         TIMED_OUT.store(true, Ordering::SeqCst);
         unsafe {
@@ -591,6 +596,7 @@ fn start_watchdog(limit: Duration, run: *mut KvmRun) {
             libc::pthread_kill(vcpu_thread as libc::pthread_t, libc::SIGUSR1);
         }
     });
+    go
 }
 
 // ------------------------------- report -------------------------------------------------------
@@ -630,7 +636,11 @@ fn print_notebook(ram: &GuestRam, exits: u64) {
              totals.iter().sum::<u64>(), totals[0], totals[1], totals[2]);
 }
 
+/// --warm: a sandbox made ahead of time. Quiet: only the program's output, and its exit code.
+static WARM: AtomicBool = AtomicBool::new(false);
+
 fn stop(ram: &GuestRam, exits: u64, why: &str) -> ! {
+    if WARM.load(Ordering::SeqCst) { eprintln!("VMM: agent STOPPED: {why}"); std::process::exit(124); }
     print_notebook(ram, exits);
     println!("\nVMM: agent STOPPED: {why}");
     std::process::exit(2);
@@ -639,6 +649,9 @@ fn stop(ram: &GuestRam, exits: u64, why: &str) -> ! {
 // ------------------------------- main ---------------------------------------------------------
 fn main() -> io::Result<()> {
     let t0 = Instant::now();
+    // VMM_TIMINGS=1: where the time of one run goes, printed to stderr at the end.
+    let timings = std::env::var_os("VMM_TIMINGS").is_some();
+    let mut marks: Vec<(&str, Instant)> = vec![("start", t0)];
     let (mut policy_path, mut agent_path, mut agent_args, mut selftest) =
         ("policies/default.policy".to_string(), None, vec!["agent".to_string()], false);
     let mut args = std::env::args().skip(1);
@@ -646,6 +659,7 @@ fn main() -> io::Result<()> {
         match a.as_str() {
             "--policy" => policy_path = args.next().ok_or_else(|| err("--policy needs a file"))?,
             "--jail-selftest" => selftest = true,
+            "--warm" => WARM.store(true, Ordering::SeqCst),
             "--" => { agent_args.extend(args.by_ref()); }
             _ => agent_path = Some(a),
         }
@@ -657,6 +671,7 @@ fn main() -> io::Result<()> {
     let root = policy.workspace.canonicalize().map_err(|e| err(format!("workspace {}: {e}", policy.workspace.display())))?;
     let mut files = Files { root: root.clone(), read: policy.read.clone(), max_open: policy.max_open_files, open: Vec::new() };
 
+    marks.push(("args, policy, read ELF", Instant::now()));
     // 1. VM + guest RAM, as in chapter 1.
     let kvm = File::options().read(true).write(true).open("/dev/kvm")?;
     let ipa = ioctl(kvm.as_raw_fd(), KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE)?;
@@ -664,10 +679,20 @@ fn main() -> io::Result<()> {
     let ram = GuestRam { ptr: mmap(RAM_SIZE, -1, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE)? };
     // 4 KiB pages, not 2 MiB "transparent huge pages": the guest touches a few scattered regions,
     // and with huge pages each one would cost 2 MiB. Measured: ~17 MiB per idle sandbox without this.
-    unsafe { libc::madvise(ram.ptr.cast(), RAM_SIZE, libc::MADV_NOHUGEPAGE) };
+    // Huge pages decide speed under nested virtualization (each TLB miss walks three sets of page tables),
+    // but each 2 MiB page costs 2 MiB of host memory. Default "code": 2 MiB pages only for the supervisor's
+    // first 2 MiB and the program's code and data. VMM_HUGEPAGES = none | code | all to compare.
+    let huge = std::env::var("VMM_HUGEPAGES").unwrap_or_else(|_| "code".into()); // measured best: see README
+    let advise = |gpa: u64, len: u64, advice| unsafe { libc::madvise(ram.ptr.add((gpa - RAM_BASE) as usize).cast(), len as usize, advice) };
+    if huge != "all" { advise(RAM_BASE, RAM_SIZE as u64, libc::MADV_NOHUGEPAGE); }
+    if huge == "code" {
+        advise(RAM_BASE, 2 << 20, libc::MADV_HUGEPAGE);                 // supervisor code, boot record, doorbell, policy
+        advise(ELF_LO, ELF_HI - ELF_LO, libc::MADV_HUGEPAGE);           // the program's code and data
+    }
     let region = MemRegion { slot: 0, flags: 0, guest_phys_addr: RAM_BASE, memory_size: RAM_SIZE as u64, userspace_addr: ram.ptr as u64 };
     ioctl(vm.as_raw_fd(), KVM_SET_USER_MEMORY_REGION, &region as *const _ as u64)?;
 
+    marks.push(("create VM + memory slot", Instant::now()));
     // 2. Supervisor, policy, the agent's program (like execve), page tables, stack, boot record.
     ram.write_bytes(RAM_BASE, SUPERVISOR);
     write_policy_page(&ram, &policy);
@@ -685,15 +710,18 @@ fn main() -> io::Result<()> {
         perms[((page - RAM_BASE) >> 12) as usize] = NO_EXEC_EL0 | NO_EXEC_EL1;
     }
     build_page_tables(&ram, &perms);
-    let sp = build_stack(&ram, &prog, &agent_args)?;
+    let warm = WARM.load(Ordering::SeqCst);
+    let sp = if warm { 0 } else { build_stack(&ram, &prog, &agent_args)? }; // warm: built when the request comes
     // Wall 3 doesn't trust the supervisor's pointer checks either: forwarded results only ever land
     // in, and output only ever comes from, the agent's own areas.
     let agent_mem = |gpa: u64, len: u64| gpa.checked_add(len).is_some_and(|end|
         (gpa >= ELF_LO && end <= mmap_end) || (gpa >= STACK_LO && end <= STACK_HI));
-    for (i, v) in [prog.entry, sp, BRK_START, BRK_END, MMAP_START, mmap_end, prog.rw_lo, prog.rw_hi, TMP_LO, tmp_hi].into_iter().enumerate() {
+    for (i, v) in [prog.entry, sp, BRK_START, BRK_END, MMAP_START, mmap_end, prog.rw_lo, prog.rw_hi, TMP_LO, tmp_hi,
+                                     if !warm { 0 } else if std::env::var_os("VMM_NO_PREFAULT").is_some() { 2 } else { 1 }, prog.lo, prog.hi, STACK_HI, wall_ns()].into_iter().enumerate() {
         ram.write_u64(BOOT_INFO + i as u64 * 8, v);
     }
 
+    marks.push(("load supervisor + ELF, page tables, stack", Instant::now()));
     // 3. One vCPU, starting in the supervisor at guest level 0.
     let vcpu = ioctl_fd(vm.as_raw_fd(), KVM_CREATE_VCPU, 0)?;
     let run_size = ioctl(kvm.as_raw_fd(), KVM_GET_VCPU_MMAP_SIZE, 0)? as usize;
@@ -704,21 +732,31 @@ fn main() -> io::Result<()> {
     let pc = RAM_BASE;
     ioctl(vcpu.as_raw_fd(), KVM_SET_ONE_REG, &OneReg { id: REG_PC, addr: &pc as *const _ as u64 } as *const _ as u64)?;
 
+    marks.push(("create vCPU + init", Instant::now()));
     // 4. Watchdog, then lock this process down. From here on the VMM can't open sockets, start
     //    programs or read anything outside the workspace, even if the agent took it over.
-    start_watchdog(policy.time_limit, run);
+    let go = start_watchdog(policy.time_limit, run);
     let jail_status = jail(&root)?;
+    if !warm {
     println!("VMM: policy {policy_path}: time {} ms, memory {} MB, output {} KB, open files {}, read {:?}",
              policy.time_limit.as_millis(), policy.memory_mb, policy.max_output >> 10, policy.max_open_files, policy.read);
     println!("VMM: jail: {jail_status}");
     println!("VMM: agent {agent_path} {:?} ({} KB), entry {:#x}\n", &agent_args[1..], elf.len() / 1024, prog.entry);
+    go.send(()).ok();
+    }
     if selftest { jail_selftest(); return Ok(()); }
 
+    marks.push(("watchdog + jail (seccomp, Landlock)", Instant::now()));
     // 5. Run. Every exit is a doorbell ring from the supervisor (or the watchdog).
     let (mut exits, mut printed) = (0u64, 0u64);
+    let (mut in_guest, mut in_exits) = (Duration::ZERO, Duration::ZERO);
     let mut out = io::stdout().lock();
     let code = loop {
-        if let Err(e) = ioctl(vcpu.as_raw_fd(), KVM_RUN, 0) {
+        let entered = Instant::now();
+        let ran = ioctl(vcpu.as_raw_fd(), KVM_RUN, 0);
+        in_guest += entered.elapsed();
+        let handling = Instant::now();
+        if let Err(e) = ran {
             if e.raw_os_error() == Some(libc::EINTR) && TIMED_OUT.load(Ordering::SeqCst) {
                 drop(out);
                 stop(&ram, exits, &format!("time limit of {} ms reached (the watchdog interrupted the vCPU)", policy.time_limit.as_millis()));
@@ -819,6 +857,25 @@ fn main() -> io::Result<()> {
                 }
                 0
             }
+            HC_READY if warm => {
+                // Ready: tell whoever made us (one byte), then wait for the request on stdin:
+                // a 4-byte length, then the arguments separated by NUL bytes.
+                out.write_all(&[0x06])?;
+                out.flush()?;
+                let mut len = [0u8; 4];
+                let mut stdin = io::stdin().lock();
+                stdin.read_exact(&mut len)?;
+                let mut body = vec![0u8; u32::from_le_bytes(len).min(64 << 10) as usize];
+                stdin.read_exact(&mut body)?;
+                agent_args.truncate(1);
+                agent_args.extend(body.split(|&c| c == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()));
+                let sp = build_stack(&ram, &prog, &agent_args)?;
+                ram.write_u64(BOOT_INFO + 8, sp);
+                ram.write_u64(BOOT_INFO + 14 * 8, wall_ns()); // the real time, now that the program starts
+                go.send(()).ok(); // the time limit starts now
+                marks.push(("warm: waited for the request", Instant::now()));
+                0
+            }
             HC_EXIT => break a as i64,
             HC_FAULT => {
                 drop(out);
@@ -836,10 +893,23 @@ fn main() -> io::Result<()> {
             _ => return Err(err(format!("unknown doorbell request {op}"))),
         };
         ram.write_u64(HC_PAGE + 32, result as u64);
+        in_exits += handling.elapsed();
     };
     drop(out);
 
+    marks.push(("run: guest + exits", Instant::now()));
+    if warm {
+        if timings { for w in marks.windows(2) { eprintln!("timing {:>8.3} ms  {}", (w[1].1 - w[0].1).as_secs_f64() * 1e3, w[1].0); } }
+        std::process::exit(code as i32);
+    }
     print_notebook(&ram, exits);
+    if timings {
+        let mut prev = t0;
+        for (name, at) in &marks[1..] { eprintln!("timing {:>8.3} ms  {name}", (*at - prev).as_secs_f64() * 1e3); prev = *at; }
+        eprintln!("timing {:>8.3} ms    of which inside KVM_RUN (guest code + exit round trips)", in_guest.as_secs_f64() * 1e3);
+        eprintln!("timing {:>8.3} ms    of which the VMM handling {exits} exits", in_exits.as_secs_f64() * 1e3);
+        eprintln!("timing {:>8.3} ms  total inside main()", t0.elapsed().as_secs_f64() * 1e3);
+    }
     let how = if code > 128 && code < 128 + 65 { format!(" (signal {}: the program ended itself, e.g. abort())", code - 128) } else { String::new() };
     println!("\nVMM: agent exited with code {code}{how}. Total time {:.1} ms (create VM + load + run).", t0.elapsed().as_secs_f64() * 1e3);
     Ok(())

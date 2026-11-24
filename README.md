@@ -19,25 +19,72 @@ From a MacBook (Apple M4 Pro), inside a Lima VM running Alpine Linux 6.18 with *
 virtualization**: every VM exit crosses two hypervisors, so exits are slower than on bare-metal Linux. The laptop was
 also running other work. Treat these as conservative, single-machine numbers; bare-metal runs are still to do.
 
-| | 4 KiB guest pages (default) | 2 MiB transparent huge pages |
+**Per tool call**, the same commands on the same machine
+([`results/warm-pool.txt`](ch01d-real-agent/results/warm-pool.txt)), median / p99:
+
+| A call to `busybox …` | `cat` a file | `grep -rn` over the workspace | `sha256sum` | `ls -la` |
+|---|---|---|---|---|
+| Plain process, no isolation | 0.77 / 1.59 ms | 0.79 / 1.37 ms | 0.73 / 0.86 ms | 0.84 / 1.08 ms |
+| Fresh namespace sandbox per call (`bwrap`: new user, pid, net, mount namespaces) | 2.97 / 3.89 ms | 3.06 / 3.91 ms | 2.93 / 3.58 ms | 2.98 / 3.74 ms |
+| **Cold VM per call** (`vmm`: everything at call time) | 3.96 / 5.04 ms | 4.60 / 5.40 ms | 4.22 / 4.83 ms | 4.15 / 4.92 ms |
+| **Warm VM per call** (from a pool, see [Warm pool](#warm-pool-a-fresh-vm-in-about-2-ms)) | **1.56 / 2.14 ms** | **2.14 / 2.77 ms** | **1.55 / 2.40 ms** | **2.12 / 2.93 ms** |
+
+Every call gets a VM nobody used before, even from the pool. A warm VM costs about 1 ms more than a plain process, and
+about 1 ms *less* than a fresh namespace sandbox.
+
+**Sandboxes in bulk** ([`results/loadtest.txt`](ch01d-real-agent/results/loadtest.txt)), with the default memory set-up
+(2 MiB pages for code) and with 4 KiB pages everywhere (`VMM_HUGEPAGES=none`):
+
+| | 2 MiB pages for code (default) | 4 KiB pages everywhere |
 |---|---|---|
-| **Cold start**: new process, create VM, load the ELF, supervisor starts, agent prints a line, VM exits | **p50 4.2 ms**, p99 5.3 ms | **p50 3.0 ms**, p99 3.4 ms |
-| **Throughput** on 2 vCPUs (full lifecycle per sandbox) | up to **338 sandboxes/s** | up to **555 sandboxes/s** |
-| **Memory per idle sandbox** (host memory actually consumed: VMM process, guest pages touched, KVM structures) | **3.1 MB**: 190 idle sandboxes in 579 MB | 16.8 MB: 40 idle sandboxes in 672 MB |
-| **CPU with every sandbox idle** | 0.0% of the machine (190 sandboxes) | 0.2% (40 sandboxes) |
+| **Cold start**: new process, create VM, load the ELF, supervisor starts, agent prints a line, VM exits | **p50 3.0 ms**, p99 3.5 ms | p50 4.2 ms, p99 5.3 ms |
+| **Throughput** on 2 vCPUs (full lifecycle per sandbox) | up to **515 sandboxes/s** | up to 338 sandboxes/s |
+| **Memory per idle sandbox** (host memory actually consumed: VMM process, guest pages touched, KVM structures) | 6.1 MB: 100 idle sandboxes in 605 MB | **3.1 MB**: 190 idle sandboxes in 579 MB |
+| **CPU with every sandbox idle** | 0.2% of the machine | 0.0% |
 | Memory returned after killing all | yes | yes |
 
-The default trades start-up speed for density: with huge pages, each scattered region the guest touches costs 2 MiB. The
-huge-page column was measured with the first, ~520-line supervisor; the 4 KiB column with the current one, which has a
-file-descriptor table, folders and `/tmp`. Between those versions on the same laptop, cold start measured 3.8–5.0 ms and
-throughput 338–385/s; run-to-run noise on a busy laptop is of that size.
+Speed or density: the choice is one setting. (2 MiB pages *everywhere* is worse on both counts: 4.1 ms per warm call and
+21.5 MB per sandbox, because every scattered region then costs a zeroed 2 MiB page.)
 
 Raw outputs: [`ch01d-real-agent/results/`](ch01d-real-agent/results/).
 
 The demo agent (heap, a hash map, file reads, five forbidden actions) makes **51 system calls: 27 answered inside the VM,
 8 refused inside the VM, 16 forwarded**. That's **17 VM exits** in total, and the run takes 10–30 ms including VM creation.
-Real tools take 3.5–6.5 ms each, VM creation included: `grep -rn` over the workspace makes 39 system calls and 14 exits.
+`grep -rn` over the workspace makes 39 system calls, and 14 of them leave the VM.
 `mkdir -p /tmp/a/b/c` makes 20 system calls and **one** exit, the final one.
+
+## Warm pool: a fresh VM in about 2 ms
+
+Where did a cold call's time go? `VMM_TIMINGS=1` prints it. For `grep -rn`, about 7.5 ms at first:
+
+| Part | Time |
+|---|---|
+| Start and end the VMM process | 0.65 ms |
+| Read the program and the policy | 0.9 ms |
+| Load the program, build page tables | 0.9 ms |
+| Lock the VMM down (seccomp, Landlock, watchdog) | 0.9 ms |
+| Create the VM and vCPU | 0.1 ms |
+| Run: the program, its page faults and its 14 exits | ~5 ms, of which the actual `grep` is well under 1 ms |
+
+The run itself was the surprise. Under nested virtualization, every TLB miss inside the sandbox walks three sets of page
+tables: the sandbox's, the Linux VM's and macOS's. With 4 KiB pages there are many misses. Pre-mapping pages saved almost
+nothing on its own. **2 MiB pages for just the program's code and the supervisor** cut a warm call from 7.1 to 2.3 ms
+(and a cold one from 6.7 to 4.5 ms), for about 2 MB more host memory per sandbox.
+
+The warm pool then moves everything else off the call's path:
+- `vmm --warm` does all the set-up, including the jail. The supervisor maps the pages the program will need (pre-mapping
+  is worth it once code uses 2 MiB pages: 5.7 → 2.5 ms). Then it rings a "ready" doorbell, and the VMM waits on stdin.
+- A call writes its arguments. The VMM builds the program's stack and starts the clock for the time limit (it starts at
+  the call, not while waiting). Then the program runs.
+- [`pool`](ch01d-real-agent/vmm/src/bin/pool.rs) keeps N such sandboxes ready and builds a replacement **after** each
+  call, so building never competes with a running call for the CPUs.
+
+Honest limits of these numbers:
+- **Back-to-back calls** empty the pool; each call then waits for a sandbox to be built, which is slower than a cold
+  start (5–6 ms). Agents leave seconds between tool calls (the model is thinking), which is where a pool shines.
+- **After about a second of idling** everything here gets slower: a plain process goes from 1 ms to 5–6 ms, and a warm VM
+  to 9–10 ms. The Mac lets the Lima VM's CPUs sleep, and waking them, plus the nested state, costs that. On a busy
+  server or bare metal this should mostly vanish, but it is not measured yet.
 
 ## How it works
 
@@ -220,9 +267,9 @@ hardware or end point they measure. **This is not a side-by-side benchmark.**
 |---|---|---|
 | What runs inside each VM | A full Linux guest kernel | No kernel: a ~1,200-line supervisor |
 | Emulated devices | 5 (virtio-net, virtio-block, virtio-vsock, serial, keyboard controller) | **0**: no virtio, no serial, no device tree |
-| Boot | Boots a guest kernel (<125 ms) | **Nothing to boot**: about 4 ms for the whole lifecycle |
-| Memory | <5 MiB VMM overhead, plus the guest kernel and its memory | **3.1 MB total** per idle sandbox |
-| Creation rate | Up to 150 microVMs/s per host | 338–555/s on just 2 vCPUs, nested |
+| Boot | Boots a guest kernel (<125 ms) | **Nothing to boot**: 3–4 ms for the whole lifecycle cold, about 2 ms from a warm pool |
+| Memory | <5 MiB VMM overhead, plus the guest kernel and its memory | **3.1–6.1 MB total** per idle sandbox (density or speed setting) |
+| Creation rate | Up to 150 microVMs/s per host | 338–515/s on just 2 vCPUs, nested |
 | What the sandbox sees | Devices and packets | **Every system call**, with its paths and arguments, in an audit log |
 | Policy granularity | Network and disk level | Per system call, per path prefix, per errno. L7 rules and credential injection are possible. |
 | **Compatibility** | **Anything Linux runs**: Python, Node, shells, `pip install` | **Only what the supervisor implements**: ~70 system calls; static, single-threaded programs; real tools like busybox, but no starting new programs yet |
@@ -268,6 +315,8 @@ limactl shell vmm ./run-tests.sh             # watchdog, memory, output, jail se
 limactl shell vmm ./run-redteam.sh           # 138 attacks, 21 must-stop attacks, 20 fuzz runs (FUZZ_SEEDS=100 for more)
 limactl shell vmm sh -c 'sudo apk add busybox-static && ./compat/run-busybox.sh'   # real tools
 limactl shell vmm ./vmm/target/aarch64-unknown-linux-musl/release/loadtest              # the numbers above
+limactl shell vmm ./vmm/target/aarch64-unknown-linux-musl/release/pool compat/bin/busybox -- grep -rn agent /workspace
+limactl shell vmm sh -c 'VMM_TIMINGS=1 ./vmm/target/aarch64-unknown-linux-musl/release/vmm compat/bin/busybox -- true'   # where the time goes
 ```
 
 Run your own program: build it as a static arm64 Linux binary linked at `0x81000000` (see

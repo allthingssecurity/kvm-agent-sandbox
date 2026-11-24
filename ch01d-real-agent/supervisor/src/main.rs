@@ -39,7 +39,8 @@ const AGENT_HI: u64 = 0x8800_0000;
 const DOORBELL: u64 = 0x0900_0000;
 
 #[repr(C)]
-struct BootInfo { entry: u64, sp: u64, brk_start: u64, brk_end: u64, mmap_start: u64, mmap_end: u64, rw_lo: u64, rw_hi: u64, tmp_lo: u64, tmp_hi: u64 }
+struct BootInfo { entry: u64, sp: u64, brk_start: u64, brk_end: u64, mmap_start: u64, mmap_end: u64, rw_lo: u64, rw_hi: u64, tmp_lo: u64, tmp_hi: u64,
+                  warm: u64, elf_lo: u64, elf_hi: u64, stack_hi: u64, wall_ns: u64 }
 fn boot() -> &'static BootInfo { unsafe { &*(BOOT_INFO as *const BootInfo) } }
 
 // Doorbell requests, handled by the VMM.
@@ -58,6 +59,7 @@ const HC_SLEEP: u64 = 12;
 const HC_STAT: u64 = 13;
 const HC_READLINK: u64 = 14;
 const HC_GETDENTS: u64 = 15;
+const HC_READY: u64 = 16; // warm mode: "everything is set up; give me the request"
 
 // Policy actions.
 const ALLOW: u8 = 1;
@@ -131,6 +133,7 @@ static BRK: AtomicU64 = AtomicU64::new(0);
 static MMAP_NEXT: AtomicU64 = AtomicU64::new(0);
 static PATH_NEXT: AtomicU64 = AtomicU64::new(PATH_LOG);
 static LAST_PATH: AtomicU64 = AtomicU64::new(0);
+static WALL_OFFSET_NS: AtomicU64 = AtomicU64::new(0); // real time minus our counter's time
 static EXITED: AtomicBool = AtomicBool::new(false); // did this system call ring the doorbell?
 
 // ------------------------------- entry, vectors, trap frame (assembly) -------------------------
@@ -261,6 +264,18 @@ extern "C" fn sup_main() -> ! {
         s.tmp_next = b.tmp_lo;
         tmp_create_root(s);
     }
+    if b.warm != 0 {
+        // A warm sandbox: touch the pages the program is about to use, so KVM maps them now and not
+        // one fault at a time during the call. Then wait (in the VMM) for the request, which writes
+        // the program's arguments and stack pointer into the boot record.
+        if b.warm == 1 { prefault(b); } // 2: warm without pre-mapping (for measuring)
+        hypercall(HC_READY, 0, 0, 0);
+    }
+    let (entry, sp) = unsafe { (core::ptr::read_volatile(&b.entry), core::ptr::read_volatile(&b.sp)) };
+    // The CPU counter starts near zero for each VM; the VMM wrote the real time just before we ran.
+    let (secs, nanos) = now();
+    let wall = unsafe { core::ptr::read_volatile(&b.wall_ns) };
+    WALL_OFFSET_NS.store(wall.saturating_sub(secs * 1_000_000_000 + nanos), Relaxed);
     unsafe {
         asm!(
             "msr elr_el1, x9",                // 3. where eret goes: the agent's entry point
@@ -270,10 +285,27 @@ extern "C" fn sup_main() -> ! {
             "mov x6, xzr", "mov x7, xzr", "mov x8, xzr", "mov x9, xzr", "mov x10, xzr", "mov x11, xzr",
             "mov x29, xzr", "mov x30, xzr",
             "eret",
-            in("x9") b.entry, in("x10") b.sp, in("x11") 0x3c0u64,
+            in("x9") entry, in("x10") sp, in("x11") 0x3c0u64,
             options(noreturn),
         );
     }
+}
+
+/// Map pages ahead of time: read the program's pages (they hold its code and data already) and
+/// write a zero into the first pages of the heap, the mmap area and the stack (fresh memory).
+fn prefault(b: &BootInfo) {
+    let mapped = |page: u64| { let par: u64; unsafe { asm!("at s1e1r, {0}", "isb", "mrs {1}, par_el1", in(reg) page, out(reg) par) }; par & 1 == 0 };
+    let mut page = b.elf_lo & !0xfff;
+    while page < b.elf_hi {
+        if mapped(page) { unsafe { core::ptr::read_volatile(page as *const u8); } }
+        page += 4096;
+    }
+    let write = |lo: u64, hi: u64| { let mut p = lo; while p < hi { unsafe { (p as *mut u8).write_volatile(0) }; p += 4096; } };
+    write(b.brk_start, (b.brk_start + (128 << 10)).min(b.brk_end));
+    write(b.mmap_start, (b.mmap_start + (512 << 10)).min(b.mmap_end));
+    write(b.stack_hi - (32 << 10), b.stack_hi);
+    write(LOG_BASE + 4096, LOG_BASE + (16 << 10)); // our audit log and path copies, the first pages
+    write(PATH_LOG, PATH_LOG + (8 << 10));
 }
 
 // ------------------------------- the door: everything the agent needs level 0 for -------------
@@ -346,7 +378,7 @@ fn syscall(s: &mut State, nr: u64, x: &[u64; 32]) -> i64 {
         134 => zero_out(a(2), 32),                    // rt_sigaction: no signals here; "old" = default
         135 => zero_out(a(2), 8),                     // rt_sigprocmask
         132 => sigaltstack(a(1)),
-        113 => clock_gettime(a(1)),
+        113 => clock_gettime(a(0), a(1)),
         73 => ppoll(s, a(0), a(1)),
         124 => 0,                                     // sched_yield
         158 => 0,                                     // getgroups: no extra groups
@@ -506,9 +538,13 @@ fn now() -> (u64, u64) {
     (ticks / freq, (ticks % freq) * 1_000_000_000 / freq)
 }
 
-fn clock_gettime(ts: u64) -> i64 {
+fn clock_gettime(clock: u64, ts: u64) -> i64 {
     if !user_writable(ts, 16) { return -EFAULT; }
-    let (secs, nanos) = now();
+    let (mut secs, mut nanos) = now();
+    if matches!(clock, 0 | 5 | 11) { // CLOCK_REALTIME, _COARSE, CLOCK_TAI: wall time
+        let t = secs * 1_000_000_000 + nanos + WALL_OFFSET_NS.load(Relaxed);
+        (secs, nanos) = (t / 1_000_000_000, t % 1_000_000_000);
+    }
     unsafe {
         (ts as *mut u64).write_volatile(secs);
         ((ts + 8) as *mut u64).write_volatile(nanos);

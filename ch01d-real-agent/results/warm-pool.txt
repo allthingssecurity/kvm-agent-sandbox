@@ -1,0 +1,44 @@
+call: busybox grep -rn agent /workspace   (200 calls per row; median / p99 in ms, measured by the caller)
+
+                                                  median / p99    throughput
+  plain process (no isolation)                   0.79 /   1.37    1232 calls/s
+  fresh namespace sandbox (bwrap)                3.06 /   3.91     333 calls/s
+  cold VM (vmm: all set-up at call time)         4.60 /   5.40     217 calls/s
+  warm VM, pool of 4, calls 20 ms apart          2.14 /   2.77     393 calls/s
+  warm VM, pool of 4, back to back               6.11 /  11.62     163 calls/s
+
+  warm output identical to the bwrap run (same workspace): yes
+
+call: busybox cat /workspace/notes.txt   (200 calls per row; median / p99 in ms, measured by the caller)
+
+                                                  median / p99    throughput
+  plain process (no isolation)                   0.77 /   1.59    1224 calls/s
+  fresh namespace sandbox (bwrap)                2.97 /   3.89     347 calls/s
+  cold VM (vmm: all set-up at call time)         3.96 /   5.04     252 calls/s
+  warm VM, pool of 4, calls 20 ms apart          1.56 /   2.14     492 calls/s
+  warm VM, pool of 4, back to back               5.17 /  10.53     188 calls/s
+
+  warm output identical to the bwrap run (same workspace): yes
+
+call: busybox sha256sum /workspace/notes.txt   (200 calls per row; median / p99 in ms, measured by the caller)
+
+                                                  median / p99    throughput
+  plain process (no isolation)                   0.73 /   0.86    1350 calls/s
+  fresh namespace sandbox (bwrap)                2.93 /   3.58     347 calls/s
+  cold VM (vmm: all set-up at call time)         4.22 /   4.83     236 calls/s
+  warm VM, pool of 4, calls 20 ms apart          1.55 /   2.40     501 calls/s
+  warm VM, pool of 4, back to back               5.39 /   9.50     188 calls/s
+
+  warm output identical to the bwrap run (same workspace): yes
+
+call: busybox ls -la /workspace   (200 calls per row; median / p99 in ms, measured by the caller)
+
+                                                  median / p99    throughput
+  plain process (no isolation)                   0.84 /   1.08    1179 calls/s
+  fresh namespace sandbox (bwrap)                2.98 /   3.74     346 calls/s
+  cold VM (vmm: all set-up at call time)         4.15 /   4.92     240 calls/s
+  warm VM, pool of 4, calls 20 ms apart          2.12 /   2.93     396 calls/s
+  warm VM, pool of 4, back to back               5.24 /  11.25     176 calls/s
+
+  warm output identical to the bwrap run (same workspace): NO
+

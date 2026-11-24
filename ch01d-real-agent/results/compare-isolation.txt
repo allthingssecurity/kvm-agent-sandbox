@@ -1,0 +1,22 @@
+100 runs each; median / p99 in ms (wall clock, including process start)
+
+tool call                           native   bwrap (netns..)   kvm-vm (ours)
+cat a file                   0.78 /   1.72     2.92 /   3.66   3.62 /   4.39
+grep -rn over workspace      0.83 /   0.96     3.31 /   4.02   4.81 /   5.91
+sha256sum a file             0.82 /   0.98     3.02 /   3.89   3.79 /   4.55
+ls -la workspace             0.81 /   0.91     3.11 /   3.81   4.03 /   5.01
+
+Python start-up, which most agent skills need (the kvm-vm sandbox can't run Python yet):
+  native   python3 -c ...     5.28 /   5.55 ms
+  bwrap    python3 -c ...     7.28 /   8.76 ms
+
+Memory of one idle sandbox, resident (RSS), measured after 1 s:
+  native sleep              0.56 MB
+  bwrap + sleep             1.30 MB
+  native python3 (idle)     7.01 MB
+  kvm-vm + sleep (VMM)      7.98 MB   (RSS of the VMM; host memory per idle sandbox measured by loadtest: 3.1 MB)
+
+Network from inside (curl-like TCP connect to 1.1.1.1:443):
+  native   CONNECTED
+  bwrap    blocked: OSError: [Errno 101] Network unreachable
+  kvm-vm   blocked: socket() refused by the policy
