@@ -1,0 +1,3 @@
+# A system call name the VMM doesn't know. It must refuse the whole file.
+workspace = ../ch01d-real-agent/workspace
+allow     = read write opennat

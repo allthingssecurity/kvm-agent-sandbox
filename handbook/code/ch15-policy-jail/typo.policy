@@ -1,0 +1,5 @@
+# One typo: "alow" instead of "allow". The VMM must refuse the whole file.
+time_limit_ms = 1000
+workspace     = ../ch01d-real-agent/workspace
+read          = /workspace/
+alow = read write openat close exit_group

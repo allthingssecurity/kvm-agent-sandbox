@@ -1,0 +1,11 @@
+[package]
+name = "seccomp-order"
+version = "0.1.0"
+edition = "2024"
+description = "War story: a seccomp argument check that never fired"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"

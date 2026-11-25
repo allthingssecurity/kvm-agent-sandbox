@@ -1,0 +1,6 @@
+# Build on macOS, run on Linux: a static aarch64 binary linked with the lld that ships with Rust.
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

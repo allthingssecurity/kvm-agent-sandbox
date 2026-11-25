@@ -1,0 +1,8 @@
+[package]
+name = "wrong-address"
+version = "0.1.0"
+edition = "2024"
+description = "showstack, linked by Rust's default rules: a fixed address outside the sandbox's program area"
+
+[profile.release]
+opt-level = "s"

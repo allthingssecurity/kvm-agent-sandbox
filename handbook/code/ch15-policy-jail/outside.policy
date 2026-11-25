@@ -1,0 +1,4 @@
+# A read prefix outside the workspace. The VMM must refuse the whole file.
+workspace = ../ch01d-real-agent/workspace
+read      = /etc/
+allow     = read write openat close

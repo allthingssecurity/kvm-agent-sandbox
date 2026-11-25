@@ -1,0 +1,8 @@
+# Rust's defaults for this target: a static program linked at a fixed
+# address (0x200000). The VMM refuses it: it isn't inside the program area.
+# The agent in ch01d-real-agent/ links at 0x81000000 instead.
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

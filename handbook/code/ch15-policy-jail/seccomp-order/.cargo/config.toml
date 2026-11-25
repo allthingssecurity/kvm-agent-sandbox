@@ -1,0 +1,6 @@
+# Build on the Mac, run in the lab VM (a plain Linux program, no sandbox).
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
