@@ -13,6 +13,13 @@ doesn't know it's sandboxed. It can read a host folder (read-only) and write to 
 > Status: a working research prototype from a book on writing a VMM from scratch. It is **not** audited and not ready
 > for hostile production traffic. The limitations are listed below.
 
+## The book
+
+**[Hardware Sandboxes from Scratch](https://leanpub.com/hardwaresandboxesfromscratch)** explains this sandbox from the
+ground up: the instruction pointer, privilege levels, page tables, a hand-built container, the smallest KVM virtual
+machine in C and in Rust, and then this supervisor, its policy, its red-team tests and its warm pool. 18 chapters,
+56 figures, and the code for each chapter is in [`handbook/code/`](handbook/code/). The first two chapters are free.
+
 ## Watch: how it works (8.6 minutes)
 
 From the CPU's privilege levels and page tables, through how exploits happen and why containers share one kernel, to
