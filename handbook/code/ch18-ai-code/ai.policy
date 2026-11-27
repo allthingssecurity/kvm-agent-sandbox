@@ -1,0 +1,30 @@
+# Chapter 18: the default policy, with more memory and time for an interpreter.
+# Anything not mentioned is refused (fail closed).
+
+# ---- limits ----
+time_limit_ms   = 10000   # wall clock; enforced by the watchdog
+memory_mb       = 84      # the most the program area allows
+tmp_kb          = 4096    # /tmp: files and folders kept in VM memory; writes never reach the host
+max_output_kb   = 64      # bytes the agent may print
+max_open_files  = 8
+
+# ---- files: the guest's /workspace is this host folder, read-only; /tmp is writable, inside the VM ----
+workspace       = ../handbook/code/ch18-ai-code/workspace   # relative to ch01d-real-agent/
+read            = /workspace/          # path prefixes the agent may open
+
+# ---- system calls the agent may make ----
+# memory and start-up (answered inside the VM)
+allow = brk mmap munmap mprotect madvise set_tid_address
+allow = rt_sigaction rt_sigprocmask sigaltstack ppoll ioctl
+allow = clock_gettime nanosleep clock_nanosleep getpid gettid getuid geteuid getgid getegid
+# identity and limits (answered inside the VM); signals only to itself (abort, raise)
+allow = getppid getgroups sched_getaffinity sched_yield sysinfo getrusage uname umask setuid setgid getresuid getresgid getpgid setpgid setsid prlimit64 getrlimit
+allow = kill tkill tgkill
+# files and folders: /tmp is answered inside the VM, /workspace is forwarded to the host (after checks)
+allow = write writev read readv openat close fstat newfstatat lseek getdents64 readlinkat faccessat faccessat2
+allow = getcwd chdir fchdir dup dup3 fcntl ftruncate fsync fdatasync mkdirat unlinkat renameat renameat2
+allow = getrandom
+
+# ---- explicit refusals, with a clear error for the agent ----
+deny socket socketpair bind connect = EACCES    # no network
+deny clone clone3 execve            = EPERM     # no new processes

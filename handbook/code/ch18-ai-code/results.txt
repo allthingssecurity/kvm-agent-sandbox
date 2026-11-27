@@ -1,0 +1,216 @@
+=== 18.3 and 18.4: Python
+$ $V --policy $C/ai.policy $B/micropython -- /workspace/report.py
+VMM: policy ../handbook/code/ch18-ai-code/ai.policy: time 10000 ms, memory 84 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 35 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only, no executable memory, no write opens)
+     Landlock v7: files limited to <repo>/handbook/code/ch18-ai-code/workspace (read-only); no TCP; signals and abstract sockets only within itself
+     rlimits: no new processes, no core dumps, 64 open files; not dumpable
+VMM: supervisor mapped W^X (WXN on); KVM firmware services hidden: 3 of 3; namespaces: user, IPC, UTS
+VMM: agent ../handbook/code/ch18-ai-code/build/micropython ["/workspace/report.py"] (641 KB), entry 0x81014e58
+
+total 12.40, best seller fig
+saved: {"best": "fig", "total": 12.4}
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   close                1      0   
+  ANSWERED   mmap                 3      0   
+  ANSWERED   munmap               1      0   
+  ANSWERED   openat               2      0   
+  ANSWERED   read                 2      0   
+  ANSWERED   rt_sigaction         3      0   
+  ANSWERED   rt_sigprocmask       1      0   
+  ANSWERED   set_tid_address      1      0   
+  ANSWERED   write                1      0   
+  REFUSED    newfstatat           3      0   "/usr/lib/micropython/json" -> EACCES, "/usr/lib/micropython/json.py" -> EACCES, "/usr/lib/micropython/json.mpy" -> EACCES
+  FORWARDED  close                1      1   
+  FORWARDED  newfstatat           9      9   "/workspace/json" -> ENOENT, "/workspace/json.py" -> ENOENT, "/workspace/json.mpy" -> ENOENT, ".frozen/json" -> ENOENT
+  FORWARDED  openat               2      2   "/workspace/report.py" -> fd 3, "/workspace/sales.csv" -> fd 3
+  FORWARDED  read                13     13   
+  FORWARDED  readlinkat           3      3   "micropython" -> ENOENT, "/workspace" -> EINVAL, "/workspace/report.py" -> EINVAL
+  FORWARDED  write                6      6   
+
+  54 system calls: 17 answered, 3 refused, 34 forwarded. VM exits: 35.
+
+VMM: agent exited with code 0. Total time 10.2 ms (create VM + load + run).
+
+$ $V --policy $C/ai.policy $B/micropython -- /workspace/attack.py
+VMM: policy ../handbook/code/ch18-ai-code/ai.policy: time 10000 ms, memory 84 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 35 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only, no executable memory, no write opens)
+     Landlock v7: files limited to <repo>/handbook/code/ch18-ai-code/workspace (read-only); no TCP; signals and abstract sockets only within itself
+     rlimits: no new processes, no core dumps, 64 open files; not dumpable
+VMM: supervisor mapped W^X (WXN on); KVM firmware services hidden: 3 of 3; namespaces: user, IPC, UTS
+VMM: agent ../handbook/code/ch18-ai-code/build/micropython ["/workspace/attack.py"] (641 KB), entry 0x81014e58
+
+read /etc/passwd -> refused, errno 13
+overwrite input -> refused, errno 13
+list / -> refused, errno 13
+run a shell -> refused, errno 38
+open a socket -> refused, errno 13
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   mmap                 3      0   
+  ANSWERED   munmap               1      0   
+  ANSWERED   rt_sigaction         7      0   
+  ANSWERED   rt_sigprocmask       5      0   
+  ANSWERED   set_tid_address      1      0   
+  REFUSED    newfstatat           6      0   "/usr/lib/micropython/os" -> EACCES, "/usr/lib/micropython/os.py" -> EACCES, "/usr/lib/micropython/os.mpy" -> EACCES, "/usr/lib/micropython/socket" -> EACCES
+  REFUSED    openat               3      0   "/etc/passwd" -> EACCES, "/workspace/sales.csv" -> EACCES, "/" -> EACCES
+  REFUSED    pipe2                2      0   ENOSYS
+  REFUSED    socket               1      0   EACCES
+  FORWARDED  close                1      1   
+  FORWARDED  newfstatat          18     18   "/workspace/os" -> ENOENT, "/workspace/os.py" -> ENOENT, "/workspace/os.mpy" -> ENOENT, ".frozen/os" -> ENOENT
+  FORWARDED  openat               1      1   "/workspace/attack.py" -> fd 3
+  FORWARDED  read                10     10   
+  FORWARDED  readlinkat           3      3   "micropython" -> ENOENT, "/workspace" -> EINVAL, "/workspace/attack.py" -> EINVAL
+  FORWARDED  write               30     30   
+
+  94 system calls: 19 answered, 12 refused, 63 forwarded. VM exits: 64.
+
+VMM: agent exited with code 0. Total time 11.5 ms (create VM + load + run).
+
+=== 18.5: Lua and JavaScript
+$ $V --policy $C/ai.policy $B/lua -- /workspace/report.lua
+VMM: policy ../handbook/code/ch18-ai-code/ai.policy: time 10000 ms, memory 84 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 35 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only, no executable memory, no write opens)
+     Landlock v7: files limited to <repo>/handbook/code/ch18-ai-code/workspace (read-only); no TCP; signals and abstract sockets only within itself
+     rlimits: no new processes, no core dumps, 64 open files; not dumpable
+VMM: supervisor mapped W^X (WXN on); KVM firmware services hidden: 3 of 3; namespaces: user, IPC, UTS
+VMM: agent ../handbook/code/ch18-ai-code/build/lua ["/workspace/report.lua"] (981 KB), entry 0x81003b90
+
+total 12.40, best seller fig
+read /etc/passwd ->	nil	/etc/passwd: Permission denied	13
+run a shell ->	nil	Function not implemented	38
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   clock_gettime        2      0   
+  ANSWERED   ioctl                1      0   
+  ANSWERED   mmap                15      0   
+  ANSWERED   munmap              14      0   
+  ANSWERED   rt_sigaction         6      0   
+  ANSWERED   rt_sigprocmask       5      0   
+  ANSWERED   set_tid_address      1      0   
+  REFUSED    openat               1      0   "/etc/passwd" -> EACCES
+  REFUSED    pipe2                2      0   ENOSYS
+  FORWARDED  close                2      2   
+  FORWARDED  openat               2      2   "/workspace/report.lua" -> fd 3, "/workspace/sales.csv" -> fd 3
+  FORWARDED  read                 3      3   
+  FORWARDED  readv                1      1   
+  FORWARDED  writev               3      3   
+
+  60 system calls: 46 answered, 3 refused, 11 forwarded. VM exits: 13.
+
+VMM: agent exited with code 0. Total time 7.4 ms (create VM + load + run).
+
+$ $V --policy $C/ai.policy $B/qjs -- --std /workspace/report.js
+VMM: policy ../handbook/code/ch18-ai-code/ai.policy: time 10000 ms, memory 84 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 35 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only, no executable memory, no write opens)
+     Landlock v7: files limited to <repo>/handbook/code/ch18-ai-code/workspace (read-only); no TCP; signals and abstract sockets only within itself
+     rlimits: no new processes, no core dumps, 64 open files; not dumpable
+VMM: supervisor mapped W^X (WXN on); KVM firmware services hidden: 3 of 3; namespaces: user, IPC, UTS
+VMM: agent ../handbook/code/ch18-ai-code/build/qjs ["--std", "/workspace/report.js"] (5105 KB), entry 0x8100ab9c
+
+total 12.40, best seller fig
+read /etc/passwd -> null
+run a shell -> fork error
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  3      0   
+  ANSWERED   clock_gettime        1      0   
+  ANSWERED   ioctl                1      0   
+  ANSWERED   mmap                41      0   
+  ANSWERED   munmap              40      0   
+  ANSWERED   rt_sigprocmask       4      0   
+  ANSWERED   set_tid_address      1      0   
+  REFUSED    clone                1      0   EPERM
+  REFUSED    openat               1      0   "/etc/passwd" -> EACCES
+  FORWARDED  close                2      2   
+  FORWARDED  lseek                6      6   
+  FORWARDED  openat               2      2   "/workspace/report.js" -> fd 3, "/workspace/sales.csv" -> fd 3
+  FORWARDED  readlinkat           1      1   "<input>" -> ENOENT
+  FORWARDED  readv                2      2   
+  FORWARDED  writev               3      3   
+
+  109 system calls: 91 answered, 2 refused, 16 forwarded. VM exits: 20.
+
+VMM: agent exited with code 0. Total time 12.0 ms (create VM + load + run).
+
+=== 18.6: zip-slip as a plain process
+extracted report.txt
+extracted ../../home/lima.guest/PWNED.txt
+planted by the archive
+
+=== 18.6: zip-slip in the sandbox
+$ $V --policy $C/ai.policy $B/micropython -- /workspace/untar.py /workspace/evil.tar /tmp/x
+VMM: policy ../handbook/code/ch18-ai-code/ai.policy: time 10000 ms, memory 84 MB, output 64 KB, open files 8, read ["/workspace/"]
+VMM: jail: seccomp: 35 host system calls allowed (ioctl = KVM_RUN only, write = stdout/stderr only, no executable memory, no write opens)
+     Landlock v7: files limited to <repo>/handbook/code/ch18-ai-code/workspace (read-only); no TCP; signals and abstract sockets only within itself
+     rlimits: no new processes, no core dumps, 64 open files; not dumpable
+VMM: supervisor mapped W^X (WXN on); KVM firmware services hidden: 3 of 3; namespaces: user, IPC, UTS
+VMM: agent ../handbook/code/ch18-ai-code/build/micropython ["/workspace/untar.py", "/workspace/evil.tar", "/tmp/x"] (641 KB), entry 0x81014e58
+
+extracted report.txt
+Traceback (most recent call last):
+  File "/workspace/untar.py", line 15, in <module>
+OSError: [Errno 13] EACCES
+
+  bucket     system call      calls  exits   details
+  ANSWERED   brk                  2      0   
+  ANSWERED   close                1      0   
+  ANSWERED   mkdirat              1      0   
+  ANSWERED   mmap                 3      0   
+  ANSWERED   munmap               1      0   
+  ANSWERED   openat               1      0   
+  ANSWERED   rt_sigaction         3      0   
+  ANSWERED   rt_sigprocmask       1      0   
+  ANSWERED   set_tid_address      1      0   
+  ANSWERED   write                1      0   
+  REFUSED    newfstatat           3      0   "/usr/lib/micropython/os" -> EACCES, "/usr/lib/micropython/os.py" -> EACCES, "/usr/lib/micropython/os.mpy" -> EACCES
+  REFUSED    openat               1      0   "/tmp/x/../../home/lima.guest/PWNED.txt" -> EACCES
+  FORWARDED  close                1      1   
+  FORWARDED  newfstatat           9      9   "/workspace/os" -> ENOENT, "/workspace/os.py" -> ENOENT, "/workspace/os.mpy" -> ENOENT, ".frozen/os" -> ENOENT
+  FORWARDED  openat               2      2   "/workspace/untar.py" -> fd 3, "/workspace/evil.tar" -> fd 3
+  FORWARDED  read                53     53   
+  FORWARDED  readlinkat           3      3   "micropython" -> ENOENT, "/workspace" -> EINVAL, "/workspace/untar.py" -> EINVAL
+  FORWARDED  write               19     19   
+
+  106 system calls: 15 answered, 4 refused, 87 forwarded. VM exits: 88.
+
+VMM: agent exited with code 1. Total time 12.5 ms (create VM + load + run).
+
+ls: /home/lima.guest/PWNED.txt: No such file or directory
+
+=== 18.7: start-up, fresh VM per call
+                plain  sandbox
+lua            0.73 ms   4.27 ms
+quickjs        1.24 ms   6.86 ms
+micropython    0.83 ms   4.41 ms
+CPython        5.88 ms  (plain, for scale)
+
+=== 18.7: pool, micropython
+  plain process (no isolation)                   0.74 /   0.82    1345 calls/s
+  fresh namespace sandbox (bwrap)                2.66 /   3.34     383 calls/s
+  cold VM (vmm: all set-up at call time)         3.90 /   4.49     253 calls/s
+  warm VM, pool of 4, calls 20 ms apart          1.91 /   3.39     389 calls/s
+  warm VM, pool of 4, back to back               6.20 /  10.74     174 calls/s
+
+  warm output identical to a cold VM run: yes
+
+=== 18.7: pool, lua
+  plain process (no isolation)                   0.55 /   0.70    1795 calls/s
+  fresh namespace sandbox (bwrap)                2.66 /   3.51     373 calls/s
+  cold VM (vmm: all set-up at call time)         4.27 /   5.07     235 calls/s
+  warm VM, pool of 4, calls 20 ms apart          1.56 /   2.40     500 calls/s
+  warm VM, pool of 4, back to back               5.71 /  10.80     178 calls/s
+
+  warm output identical to a cold VM run: yes
+
+=== 18.7: pool, qjs
+  plain process (no isolation)                   1.13 /   1.24     884 calls/s
+  fresh namespace sandbox (bwrap)                3.18 /   4.09     331 calls/s
+  cold VM (vmm: all set-up at call time)         6.76 /   7.78     147 calls/s
+  warm VM, pool of 4, calls 20 ms apart          1.87 /   3.16     397 calls/s
+  warm VM, pool of 4, back to back               6.72 /  14.47     146 calls/s
+
+  warm output identical to a cold VM run: yes
